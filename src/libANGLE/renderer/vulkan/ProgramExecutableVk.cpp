@@ -27,11 +27,6 @@ namespace
 // Limit decompressed vulkan pipelines to 10MB per program.
 static constexpr size_t kMaxLocalPipelineCacheSize = 10 * 1024 * 1024;
 
-uint8_t GetGraphicsProgramIndex(ProgramTransformOptions transformOptions)
-{
-    return gl::bitCast<uint8_t, ProgramTransformOptions>(transformOptions);
-}
-
 bool ValidateTransformedSpirV(vk::Context *context,
                               const gl::ShaderBitSet &linkedShaderStages,
                               const ShaderInterfaceVariableInfoMap &variableInfoMap,
@@ -244,67 +239,16 @@ vk::SpecializationConstants MakeSpecConsts(ProgramTransformOptions transformOpti
     return specConsts;
 }
 
-template <typename T>
-void UpdateDefaultUniformBlock(GLsizei count,
-                               uint32_t arrayIndex,
-                               int componentCount,
-                               const T *v,
-                               const sh::BlockMemberInfo &layoutInfo,
-                               angle::MemoryBuffer *uniformData)
+vk::GraphicsPipelineSubset GetWarmUpSubset(const angle::FeaturesVk &features)
 {
-    const int elementSize = sizeof(T) * componentCount;
-
-    uint8_t *dst = uniformData->data() + layoutInfo.offset;
-    if (layoutInfo.arrayStride == 0 || layoutInfo.arrayStride == elementSize)
-    {
-        uint32_t arrayOffset = arrayIndex * layoutInfo.arrayStride;
-        uint8_t *writePtr    = dst + arrayOffset;
-        ASSERT(writePtr + (elementSize * count) <= uniformData->data() + uniformData->size());
-        memcpy(writePtr, v, elementSize * count);
-    }
-    else
-    {
-        // Have to respect the arrayStride between each element of the array.
-        int maxIndex = arrayIndex + count;
-        for (int writeIndex = arrayIndex, readIndex = 0; writeIndex < maxIndex;
-             writeIndex++, readIndex++)
-        {
-            const int arrayOffset = writeIndex * layoutInfo.arrayStride;
-            uint8_t *writePtr     = dst + arrayOffset;
-            const T *readPtr      = v + (readIndex * componentCount);
-            ASSERT(writePtr + elementSize <= uniformData->data() + uniformData->size());
-            memcpy(writePtr, readPtr, elementSize);
-        }
-    }
+    // Only build the shaders subset of the pipeline if VK_EXT_graphics_pipeline_library is
+    // supported.
+    return features.supportsGraphicsPipelineLibrary.enabled ? vk::GraphicsPipelineSubset::Shaders
+                                                            : vk::GraphicsPipelineSubset::Complete;
 }
+}  // namespace
 
-template <typename T>
-void ReadFromDefaultUniformBlock(int componentCount,
-                                 uint32_t arrayIndex,
-                                 T *dst,
-                                 const sh::BlockMemberInfo &layoutInfo,
-                                 const angle::MemoryBuffer *uniformData)
-{
-    ASSERT(layoutInfo.offset != -1);
-
-    const int elementSize = sizeof(T) * componentCount;
-    const uint8_t *source = uniformData->data() + layoutInfo.offset;
-
-    if (layoutInfo.arrayStride == 0 || layoutInfo.arrayStride == elementSize)
-    {
-        const uint8_t *readPtr = source + arrayIndex * layoutInfo.arrayStride;
-        memcpy(dst, readPtr, elementSize);
-    }
-    else
-    {
-        // Have to respect the arrayStride between each element of the array.
-        const int arrayOffset  = arrayIndex * layoutInfo.arrayStride;
-        const uint8_t *readPtr = source + arrayOffset;
-        memcpy(dst, readPtr, elementSize);
-    }
-}
-
-class WarmUpTaskCommon : public vk::Context, public LinkSubTask
+class ProgramExecutableVk::WarmUpTaskCommon : public vk::Context, public LinkSubTask
 {
   public:
     WarmUpTaskCommon(vk::Renderer *renderer) : vk::Context(renderer) {}
@@ -346,6 +290,18 @@ class WarmUpTaskCommon : public vk::Context, public LinkSubTask
             contextVk->handleError(mErrorCode, mErrorFile, mErrorFunction, mErrorLine);
             return angle::Result::Stop;
         }
+
+        // Accumulate relevant perf counters
+        const angle::VulkanPerfCounters &from = getPerfCounters();
+        angle::VulkanPerfCounters &to         = contextVk->getPerfCounters();
+
+        to.pipelineCreationCacheHits += from.pipelineCreationCacheHits;
+        to.pipelineCreationCacheMisses += from.pipelineCreationCacheMisses;
+        to.pipelineCreationTotalCacheHitsDurationNs +=
+            from.pipelineCreationTotalCacheHitsDurationNs;
+        to.pipelineCreationTotalCacheMissesDurationNs +=
+            from.pipelineCreationTotalCacheMissesDurationNs;
+
         return angle::Result::Continue;
     }
 
@@ -365,7 +321,7 @@ class WarmUpTaskCommon : public vk::Context, public LinkSubTask
     // safe to directly access the executable from this parallel job.  Note that this is the reason
     // why the front-end does not let the parallel job continue when a relink happens or the first
     // draw with this program.
-    ProgramExecutableVk *mExecutableVk;
+    ProgramExecutableVk *mExecutableVk               = nullptr;
     const vk::PipelineRobustness mPipelineRobustness = vk::PipelineRobustness::NonRobust;
     const vk::PipelineProtectedAccess mPipelineProtectedAccess =
         vk::PipelineProtectedAccess::Unprotected;
@@ -377,7 +333,7 @@ class WarmUpTaskCommon : public vk::Context, public LinkSubTask
     unsigned int mErrorLine    = 0;
 };
 
-class WarmUpComputeTask : public WarmUpTaskCommon
+class ProgramExecutableVk::WarmUpComputeTask : public WarmUpTaskCommon
 {
   public:
     WarmUpComputeTask(vk::Renderer *renderer,
@@ -399,7 +355,7 @@ class WarmUpComputeTask : public WarmUpTaskCommon
 };
 
 using SharedRenderPass = vk::AtomicRefCounted<vk::RenderPass>;
-class WarmUpGraphicsTask : public WarmUpTaskCommon
+class ProgramExecutableVk::WarmUpGraphicsTask : public WarmUpTaskCommon
 {
   public:
     WarmUpGraphicsTask(vk::Renderer *renderer,
@@ -433,6 +389,9 @@ class WarmUpGraphicsTask : public WarmUpTaskCommon
         // Release reference to shared renderpass. If this is the last reference -
         // 1. merge ProgramExecutableVk's pipeline cache into the Renderer's cache
         // 2. cleanup temporary renderpass
+        //
+        // Note: with dynamic rendering, |mCompatibleRenderPass| holds a VK_NULL_HANDLE, and it's
+        // just used as a ref count for this purpose.
         const bool isLastWarmUpTask = mCompatibleRenderPass->getAndReleaseRef() == 1;
         if (isLastWarmUpTask)
         {
@@ -452,11 +411,6 @@ class WarmUpGraphicsTask : public WarmUpTaskCommon
     // Temporary objects to clean up at the end
     SharedRenderPass *mCompatibleRenderPass;
 };
-}  // namespace
-
-DefaultUniformBlockVk::DefaultUniformBlockVk() = default;
-
-DefaultUniformBlockVk::~DefaultUniformBlockVk() = default;
 
 // ShaderInfo implementation.
 ShaderInfo::ShaderInfo() {}
@@ -585,16 +539,16 @@ void ProgramInfo::release(ContextVk *contextVk)
 
 ProgramExecutableVk::ProgramExecutableVk(const gl::ProgramExecutable *executable)
     : ProgramExecutableImpl(executable),
-      mNumDefaultUniformDescriptors(0),
       mImmutableSamplersMaxDescriptorCount(1),
       mUniformBufferDescriptorType(VK_DESCRIPTOR_TYPE_MAX_ENUM),
       mDynamicUniformDescriptorOffsets{},
-      mWarmUpGraphicsPipelineDesc{}
+      mValidGraphicsPermutations{},
+      mValidComputePermutations{}
 {
     mDescriptorSets.fill(VK_NULL_HANDLE);
-    for (std::shared_ptr<DefaultUniformBlockVk> &defaultBlock : mDefaultUniformBlocks)
+    for (std::shared_ptr<BufferAndLayout> &defaultBlock : mDefaultUniformBlocks)
     {
-        defaultBlock = std::make_shared<DefaultUniformBlockVk>();
+        defaultBlock = std::make_shared<BufferAndLayout>();
     }
 }
 
@@ -610,6 +564,14 @@ void ProgramExecutableVk::destroy(const gl::Context *context)
 
 void ProgramExecutableVk::resetLayout(ContextVk *contextVk)
 {
+    if (!mPipelineLayout.valid())
+    {
+        ASSERT(mValidGraphicsPermutations.none());
+        ASSERT(mValidComputePermutations.none());
+
+        return;
+    }
+
     waitForPostLinkTasksImpl(contextVk);
 
     for (auto &descriptorSetLayout : mDescriptorSetLayouts)
@@ -620,7 +582,6 @@ void ProgramExecutableVk::resetLayout(ContextVk *contextVk)
     mImmutableSamplerIndexMap.clear();
 
     mDescriptorSets.fill(VK_NULL_HANDLE);
-    mNumDefaultUniformDescriptors = 0;
 
     for (vk::RefCountedDescriptorPoolBinding &binding : mDescriptorPoolBindings)
     {
@@ -635,26 +596,23 @@ void ProgramExecutableVk::resetLayout(ContextVk *contextVk)
     // Initialize with an invalid BufferSerial
     mCurrentDefaultUniformBufferSerial = vk::BufferSerial();
 
-    for (CompleteGraphicsPipelineCache &pipelines : mCompleteGraphicsPipelines)
+    for (size_t index : mValidGraphicsPermutations)
     {
-        pipelines.release(contextVk);
-    }
-    for (ShadersGraphicsPipelineCache &pipelines : mShadersGraphicsPipelines)
-    {
-        pipelines.release(contextVk);
-    }
-    for (vk::PipelineHelper &pipeline : mComputePipelines)
-    {
-        pipeline.release(contextVk);
-    }
+        mCompleteGraphicsPipelines[index].release(contextVk);
+        mShadersGraphicsPipelines[index].release(contextVk);
 
-    // Program infos and pipeline layout must be released after pipelines are; they might be having
-    // pending jobs that are referencing them.
-    for (ProgramInfo &programInfo : mGraphicsProgramInfos)
+        // Program infos and pipeline layout must be released after pipelines are; they might be
+        // having pending jobs that are referencing them.
+        mGraphicsProgramInfos[index].release(contextVk);
+    }
+    mValidGraphicsPermutations.reset();
+
+    for (size_t index : mValidComputePermutations)
     {
-        programInfo.release(contextVk);
+        mComputePipelines[index].release(contextVk);
     }
     mComputeProgramInfo.release(contextVk);
+    mValidComputePermutations.reset();
 
     mPipelineLayout.reset();
 
@@ -820,17 +778,18 @@ angle::Result ProgramExecutableVk::getPipelineCacheWarmUpTasks(
     vk::Renderer *renderer,
     vk::PipelineRobustness pipelineRobustness,
     vk::PipelineProtectedAccess pipelineProtectedAccess,
-    vk::GraphicsPipelineSubset subset,
     std::vector<std::shared_ptr<LinkSubTask>> *postLinkSubTasksOut)
 {
     ASSERT(!postLinkSubTasksOut || postLinkSubTasksOut->empty());
+
+    const vk::GraphicsPipelineSubset subset = GetWarmUpSubset(renderer->getFeatures());
 
     bool isCompute                                        = false;
     angle::FixedVector<bool, 2> surfaceRotationVariations = {false};
     vk::GraphicsPipelineDesc *graphicsPipelineDesc        = nullptr;
     vk::RenderPass compatibleRenderPass;
 
-    rx::WarmUpTaskCommon prepForWarmUpContext(renderer);
+    WarmUpTaskCommon prepForWarmUpContext(renderer);
     ANGLE_TRY(prepareForWarmUpPipelineCache(
         &prepForWarmUpContext, pipelineRobustness, pipelineProtectedAccess, subset, &isCompute,
         &surfaceRotationVariations, &graphicsPipelineDesc, &compatibleRenderPass));
@@ -840,7 +799,7 @@ angle::Result ProgramExecutableVk::getPipelineCacheWarmUpTasks(
     {
         ASSERT(!compatibleRenderPass.valid());
 
-        warmUpSubTasks.push_back(std::make_shared<rx::WarmUpComputeTask>(
+        warmUpSubTasks.push_back(std::make_shared<WarmUpComputeTask>(
             renderer, this, pipelineRobustness, pipelineProtectedAccess));
     }
     else
@@ -851,7 +810,7 @@ angle::Result ProgramExecutableVk::getPipelineCacheWarmUpTasks(
         {
             // Add a placeholder entry in GraphicsPipelineCache
             transformOptions.surfaceRotation   = surfaceRotation;
-            const uint8_t programIndex         = GetGraphicsProgramIndex(transformOptions);
+            const uint8_t programIndex         = transformOptions.permutationIndex;
             vk::PipelineHelper *pipelineHelper = nullptr;
             if (subset == vk::GraphicsPipelineSubset::Complete)
             {
@@ -865,7 +824,7 @@ angle::Result ProgramExecutableVk::getPipelineCacheWarmUpTasks(
                 pipelines.populate(mWarmUpGraphicsPipelineDesc, vk::Pipeline(), &pipelineHelper);
             }
 
-            warmUpSubTasks.push_back(std::make_shared<rx::WarmUpGraphicsTask>(
+            warmUpSubTasks.push_back(std::make_shared<WarmUpGraphicsTask>(
                 renderer, this, pipelineRobustness, pipelineProtectedAccess, subset,
                 surfaceRotation, *graphicsPipelineDesc, sharedRenderPass, pipelineHelper));
         }
@@ -913,10 +872,12 @@ angle::Result ProgramExecutableVk::prepareForWarmUpPipelineCache(
     if (isCompute)
     {
         // Initialize compute program.
-        ANGLE_TRY(initComputeProgram(context, &mComputeProgramInfo, mVariableInfoMap));
+        vk::ComputePipelineOptions pipelineOptions =
+            vk::GetComputePipelineOptions(pipelineRobustness, pipelineProtectedAccess);
+        ANGLE_TRY(
+            initComputeProgram(context, &mComputeProgramInfo, mVariableInfoMap, pipelineOptions));
 
-        *isComputeOut               = true;
-        mWarmUpGraphicsPipelineDesc = {};
+        *isComputeOut = true;
         return angle::Result::Continue;
     }
 
@@ -935,8 +896,11 @@ angle::Result ProgramExecutableVk::prepareForWarmUpPipelineCache(
     vk::AttachmentOpsArray ops;
     RenderPassCache::InitializeOpsForCompatibleRenderPass(
         mWarmUpGraphicsPipelineDesc.getRenderPassDesc(), &ops);
-    ANGLE_TRY(RenderPassCache::MakeRenderPass(
-        context, mWarmUpGraphicsPipelineDesc.getRenderPassDesc(), ops, renderPassOut, nullptr));
+    if (!context->getFeatures().preferDynamicRendering.enabled)
+    {
+        ANGLE_TRY(RenderPassCache::MakeRenderPass(
+            context, mWarmUpGraphicsPipelineDesc.getRenderPassDesc(), ops, renderPassOut, nullptr));
+    }
 
     *graphicsPipelineDescOut = &mWarmUpGraphicsPipelineDesc;
 
@@ -960,9 +924,8 @@ angle::Result ProgramExecutableVk::prepareForWarmUpPipelineCache(
     for (bool rotation : *surfaceRotationVariationsOut)
     {
         // Initialize graphics programs.
-        transformOptions.surfaceRotation       = rotation;
-        vk::ShaderProgramHelper *shaderProgram = nullptr;
-        ANGLE_TRY(initGraphicsShaderPrograms(context, transformOptions, &shaderProgram));
+        transformOptions.surfaceRotation = rotation;
+        ANGLE_TRY(initGraphicsShaderPrograms(context, transformOptions));
     }
 
     return angle::Result::Continue;
@@ -979,8 +942,7 @@ angle::Result ProgramExecutableVk::warmUpComputePipelineCache(
     // been setup by the caller. Assert that all required state is valid so all that is left will
     // be the call to `vkCreateComputePipelines`
 
-    // Make sure the program and shader modules for compute shader stage is valid.
-    ASSERT(mComputeProgramInfo.getShaderProgram());
+    // Make sure the shader module for compute shader stage is valid.
     ASSERT(mComputeProgramInfo.valid(gl::ShaderType::Compute));
 
     // No synchronization necessary since mPipelineCache is internally synchronized.
@@ -1042,7 +1004,7 @@ void ProgramExecutableVk::waitForPostLinkTasksImpl(ContextVk *contextVk)
     // Get results and clean up
     for (const std::shared_ptr<rx::LinkSubTask> &task : postLinkSubTasks)
     {
-        rx::WarmUpTaskCommon *warmUpTask = static_cast<rx::WarmUpTaskCommon *>(task.get());
+        WarmUpTaskCommon *warmUpTask = static_cast<WarmUpTaskCommon *>(task.get());
 
         // As these tasks can be run post-link, their results are ignored.  Failure is harmless, but
         // more importantly the error (effectively due to a link event) may not be allowed through
@@ -1057,33 +1019,35 @@ void ProgramExecutableVk::waitForPostLinkTasksImpl(ContextVk *contextVk)
         }
     }
 
-    mWarmUpGraphicsPipelineDesc = {};
     mExecutable->onPostLinkTasksComplete();
 }
 
-void ProgramExecutableVk::waitForPostLinkTasksIfNecessary(
+void ProgramExecutableVk::waitForGraphicsPostLinkTasks(
     ContextVk *contextVk,
-    const vk::GraphicsPipelineDesc *currentGraphicsPipelineDesc)
+    const vk::GraphicsPipelineDesc &currentGraphicsPipelineDesc)
 {
+    ASSERT(mExecutable->hasLinkedShaderStage(gl::ShaderType::Vertex));
+
     if (mExecutable->getPostLinkSubTasks().empty())
     {
         return;
     }
 
-    const vk::GraphicsPipelineSubset subset =
-        contextVk->getFeatures().supportsGraphicsPipelineLibrary.enabled
-            ? vk::GraphicsPipelineSubset::Shaders
-            : vk::GraphicsPipelineSubset::Complete;
+    const vk::GraphicsPipelineSubset subset = GetWarmUpSubset(contextVk->getFeatures());
 
-    if (currentGraphicsPipelineDesc &&
-        (mWarmUpGraphicsPipelineDesc.hash(subset) != currentGraphicsPipelineDesc->hash(subset)))
+    if (!mWarmUpGraphicsPipelineDesc.keyEqual(currentGraphicsPipelineDesc, subset))
     {
         // The GraphicsPipelineDesc used for warmup differs from the one used by the draw call.
         // There is no need to wait for the warmup tasks to complete.
         ANGLE_PERF_WARNING(
             contextVk->getDebug(), GL_DEBUG_SEVERITY_LOW,
             "GraphicsPipelineDesc used for warmup differs from the one used by draw.");
-        return;
+
+        // If the warm up tasks are finished anyway, let |waitForPostLinkTasksImpl| clean them up.
+        if (!angle::WaitableEvent::AllReady(&mExecutable->getPostLinkSubTaskWaitableEvents()))
+        {
+            return;
+        }
     }
 
     waitForPostLinkTasksImpl(contextVk);
@@ -1124,7 +1088,7 @@ void ProgramExecutableVk::addInterfaceBlockDescriptorSetDesc(
 
         const VkShaderStageFlags activeStages = gl_vk::GetShaderStageFlags(info.activeStages);
 
-        descOut->update(info.binding, descType, arraySize, activeStages, nullptr);
+        descOut->addBinding(info.binding, descType, arraySize, activeStages, nullptr);
     }
 }
 
@@ -1142,8 +1106,9 @@ void ProgramExecutableVk::addAtomicCounterBufferDescriptorSetDesc(
     VkShaderStageFlags activeStages = gl_vk::GetShaderStageFlags(info.activeStages);
 
     // A single storage buffer array is used for all stages for simplicity.
-    descOut->update(info.binding, vk::kStorageBufferDescriptorType,
-                    gl::IMPLEMENTATION_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS, activeStages, nullptr);
+    descOut->addBinding(info.binding, vk::kStorageBufferDescriptorType,
+                        gl::IMPLEMENTATION_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS, activeStages,
+                        nullptr);
 }
 
 void ProgramExecutableVk::addImageDescriptorSetDesc(vk::DescriptorSetLayoutDesc *descOut)
@@ -1183,7 +1148,7 @@ void ProgramExecutableVk::addImageDescriptorSetDesc(vk::DescriptorSetLayoutDesc 
         const VkDescriptorType descType = imageBinding.textureType == gl::TextureType::Buffer
                                               ? VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER
                                               : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        descOut->update(info.binding, descType, arraySize, activeStages, nullptr);
+        descOut->addBinding(info.binding, descType, arraySize, activeStages, nullptr);
     }
 }
 
@@ -1209,8 +1174,8 @@ void ProgramExecutableVk::addInputAttachmentDescriptorSetDesc(vk::DescriptorSetL
 
     for (uint32_t colorIndex = 0; colorIndex < gl::IMPLEMENTATION_MAX_DRAW_BUFFERS; ++colorIndex)
     {
-        descOut->update(baseBinding, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1,
-                        VK_SHADER_STAGE_FRAGMENT_BIT, nullptr);
+        descOut->addBinding(baseBinding, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1,
+                            VK_SHADER_STAGE_FRAGMENT_BIT, nullptr);
         baseBinding++;
     }
 }
@@ -1271,8 +1236,8 @@ angle::Result ProgramExecutableVk::addTextureDescriptorSetDesc(
             // externalFormat
             const TextureVk *textureVk          = (*activeTextures)[textureUnit];
             const vk::Sampler &immutableSampler = textureVk->getSampler(isSamplerExternalY2Y).get();
-            descOut->update(info.binding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, arraySize,
-                            activeStages, &immutableSampler);
+            descOut->addBinding(info.binding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, arraySize,
+                                activeStages, &immutableSampler);
             const vk::ImageHelper &image = textureVk->getImage();
             const vk::YcbcrConversionDesc ycbcrConversionDesc =
                 isSamplerExternalY2Y ? image.getY2YConversionDesc()
@@ -1309,7 +1274,7 @@ angle::Result ProgramExecutableVk::addTextureDescriptorSetDesc(
             const VkDescriptorType descType = samplerBinding.textureType == gl::TextureType::Buffer
                                                   ? VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER
                                                   : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            descOut->update(info.binding, descType, arraySize, activeStages, nullptr);
+            descOut->addBinding(info.binding, descType, arraySize, activeStages, nullptr);
         }
     }
 
@@ -1385,12 +1350,11 @@ ProgramTransformOptions ProgramExecutableVk::getTransformOptions(
 
 angle::Result ProgramExecutableVk::initGraphicsShaderPrograms(
     vk::Context *context,
-    ProgramTransformOptions transformOptions,
-    vk::ShaderProgramHelper **shaderProgramOut)
+    ProgramTransformOptions transformOptions)
 {
     ASSERT(mExecutable->hasLinkedShaderStage(gl::ShaderType::Vertex));
 
-    const uint8_t programIndex                = GetGraphicsProgramIndex(transformOptions);
+    const uint8_t programIndex                = transformOptions.permutationIndex;
     ProgramInfo &programInfo                  = mGraphicsProgramInfos[programIndex];
     const gl::ShaderBitSet linkedShaderStages = mExecutable->getLinkedShaderStages();
     gl::ShaderType lastPreFragmentStage       = gl::GetLastPreFragmentStage(linkedShaderStages);
@@ -1404,9 +1368,6 @@ angle::Result ProgramExecutableVk::initGraphicsShaderPrograms(
                                             isTransformFeedbackProgram, transformOptions,
                                             &programInfo, mVariableInfoMap));
     }
-
-    *shaderProgramOut = programInfo.getShaderProgram();
-    ASSERT(*shaderProgramOut);
 
     return angle::Result::Continue;
 }
@@ -1422,8 +1383,7 @@ angle::Result ProgramExecutableVk::initProgramThenCreateGraphicsPipeline(
     const vk::GraphicsPipelineDesc **descPtrOut,
     vk::PipelineHelper **pipelineOut)
 {
-    vk::ShaderProgramHelper *shaderProgram = nullptr;
-    ANGLE_TRY(initGraphicsShaderPrograms(context, transformOptions, &shaderProgram));
+    ANGLE_TRY(initGraphicsShaderPrograms(context, transformOptions));
 
     return createGraphicsPipelineImpl(context, transformOptions, pipelineSubset, pipelineCache,
                                       source, desc, compatibleRenderPass, descPtrOut, pipelineOut);
@@ -1445,13 +1405,11 @@ angle::Result ProgramExecutableVk::createGraphicsPipelineImpl(
     // be the call to `vkCreateGraphicsPipelines`
 
     // Make sure program index is within range
-    const uint8_t programIndex = GetGraphicsProgramIndex(transformOptions);
+    const uint8_t programIndex = transformOptions.permutationIndex;
     ASSERT(programIndex >= 0 && programIndex < ProgramTransformOptions::kPermutationCount);
 
-    // Make sure the program and shader modules for all linked shader stages are valid.
-    ProgramInfo &programInfo               = mGraphicsProgramInfos[programIndex];
-    vk::ShaderProgramHelper *shaderProgram = programInfo.getShaderProgram();
-    ASSERT(shaderProgram);
+    // Make sure the shader modules for all linked shader stages are valid.
+    ProgramInfo &programInfo = mGraphicsProgramInfos[programIndex];
     for (gl::ShaderType shaderType : mExecutable->getLinkedShaderStages())
     {
         ASSERT(programInfo.valid(shaderType));
@@ -1464,7 +1422,7 @@ angle::Result ProgramExecutableVk::createGraphicsPipelineImpl(
     if (pipelineSubset == vk::GraphicsPipelineSubset::Complete)
     {
         CompleteGraphicsPipelineCache &pipelines = mCompleteGraphicsPipelines[programIndex];
-        return shaderProgram->createGraphicsPipeline(
+        return programInfo.getShaderProgram().createGraphicsPipeline(
             context, &pipelines, pipelineCache, compatibleRenderPass, getPipelineLayout(), source,
             desc, specConsts, descPtrOut, pipelineOut);
     }
@@ -1475,7 +1433,7 @@ angle::Result ProgramExecutableVk::createGraphicsPipelineImpl(
         ASSERT(pipelineSubset == vk::GraphicsPipelineSubset::Shaders);
 
         ShadersGraphicsPipelineCache &pipelines = mShadersGraphicsPipelines[programIndex];
-        return shaderProgram->createGraphicsPipeline(
+        return programInfo.getShaderProgram().createGraphicsPipeline(
             context, &pipelines, pipelineCache, compatibleRenderPass, getPipelineLayout(), source,
             desc, specConsts, descPtrOut, pipelineOut);
     }
@@ -1489,10 +1447,9 @@ angle::Result ProgramExecutableVk::getGraphicsPipeline(ContextVk *contextVk,
 {
     ProgramTransformOptions transformOptions = getTransformOptions(contextVk, desc);
 
-    vk::ShaderProgramHelper *shaderProgram = nullptr;
-    ANGLE_TRY(initGraphicsShaderPrograms(contextVk, transformOptions, &shaderProgram));
+    ANGLE_TRY(initGraphicsShaderPrograms(contextVk, transformOptions));
 
-    const uint8_t programIndex = GetGraphicsProgramIndex(transformOptions);
+    const uint8_t programIndex = transformOptions.permutationIndex;
 
     *descPtrOut  = nullptr;
     *pipelineOut = nullptr;
@@ -1538,8 +1495,7 @@ angle::Result ProgramExecutableVk::createGraphicsPipeline(
 
     // Pull in a compatible RenderPass.
     const vk::RenderPass *compatibleRenderPass = nullptr;
-    ANGLE_TRY(contextVk->getRenderPassCache().getCompatibleRenderPass(
-        contextVk, desc.getRenderPassDesc(), &compatibleRenderPass));
+    ANGLE_TRY(contextVk->getCompatibleRenderPass(desc.getRenderPassDesc(), &compatibleRenderPass));
 
     ANGLE_TRY(initProgramThenCreateGraphicsPipeline(
         contextVk, transformOptions, pipelineSubset, pipelineCache, source, desc,
@@ -1565,7 +1521,7 @@ angle::Result ProgramExecutableVk::linkGraphicsPipelineLibraries(
     vk::PipelineHelper **pipelineOut)
 {
     ProgramTransformOptions transformOptions = getTransformOptions(contextVk, desc);
-    const uint8_t programIndex               = GetGraphicsProgramIndex(transformOptions);
+    const uint8_t programIndex               = transformOptions.permutationIndex;
 
     ANGLE_TRY(mCompleteGraphicsPipelines[programIndex].linkLibraries(
         contextVk, pipelineCache, desc, getPipelineLayout(), vertexInputPipeline, shadersPipeline,
@@ -1577,10 +1533,8 @@ angle::Result ProgramExecutableVk::linkGraphicsPipelineLibraries(
     {
         vk::SpecializationConstants specConsts = MakeSpecConsts(transformOptions, desc);
 
-        mGraphicsProgramInfos[programIndex]
-            .getShaderProgram()
-            ->createMonolithicPipelineCreationTask(contextVk, pipelineCache, desc,
-                                                   getPipelineLayout(), specConsts, *pipelineOut);
+        mGraphicsProgramInfos[programIndex].getShaderProgram().createMonolithicPipelineCreationTask(
+            contextVk, pipelineCache, desc, getPipelineLayout(), specConsts, *pipelineOut);
     }
 
     return angle::Result::Continue;
@@ -1596,23 +1550,13 @@ angle::Result ProgramExecutableVk::getOrCreateComputePipeline(
 {
     ASSERT(mExecutable->hasLinkedShaderStage(gl::ShaderType::Compute));
 
-    ANGLE_TRY(initComputeProgram(context, &mComputeProgramInfo, mVariableInfoMap));
+    vk::ComputePipelineOptions pipelineOptions =
+        vk::GetComputePipelineOptions(pipelineRobustness, pipelineProtectedAccess);
+    ANGLE_TRY(initComputeProgram(context, &mComputeProgramInfo, mVariableInfoMap, pipelineOptions));
 
-    vk::ComputePipelineFlags pipelineFlags = {};
-    if (pipelineRobustness == vk::PipelineRobustness::Robust)
-    {
-        pipelineFlags.set(vk::ComputePipelineFlag::Robust);
-    }
-    if (pipelineProtectedAccess == vk::PipelineProtectedAccess::Protected)
-    {
-        pipelineFlags.set(vk::ComputePipelineFlag::Protected);
-    }
-
-    vk::ShaderProgramHelper *shaderProgram = mComputeProgramInfo.getShaderProgram();
-    ASSERT(shaderProgram);
-    return shaderProgram->getOrCreateComputePipeline(context, &mComputePipelines, pipelineCache,
-                                                     getPipelineLayout(), pipelineFlags, source,
-                                                     pipelineOut);
+    return mComputeProgramInfo.getShaderProgram().getOrCreateComputePipeline(
+        context, &mComputePipelines, pipelineCache, getPipelineLayout(), pipelineOptions, source,
+        pipelineOut, nullptr, nullptr);
 }
 
 angle::Result ProgramExecutableVk::createPipelineLayout(
@@ -1627,8 +1571,8 @@ angle::Result ProgramExecutableVk::createPipelineLayout(
     // don't already exist in the cache.
 
     // Default uniforms and transform feedback:
-    mDefaultUniformAndXfbSetDesc  = {};
-    mNumDefaultUniformDescriptors = 0;
+    mDefaultUniformAndXfbSetDesc          = {};
+    uint32_t numDefaultUniformDescriptors = 0;
     for (gl::ShaderType shaderType : linkedShaderStages)
     {
         const ShaderInterfaceVariableInfo &info =
@@ -1636,9 +1580,10 @@ angle::Result ProgramExecutableVk::createPipelineLayout(
         // Note that currently the default uniform block is added unconditionally.
         ASSERT(info.activeStages[shaderType]);
 
-        mDefaultUniformAndXfbSetDesc.update(info.binding, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
-                                            1, gl_vk::kShaderStageMap[shaderType], nullptr);
-        mNumDefaultUniformDescriptors++;
+        mDefaultUniformAndXfbSetDesc.addBinding(info.binding,
+                                                VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1,
+                                                gl_vk::kShaderStageMap[shaderType], nullptr);
+        numDefaultUniformDescriptors++;
     }
 
     gl::ShaderType linkedTransformFeedbackStage = mExecutable->getLinkedTransformFeedbackStage();
@@ -1652,8 +1597,8 @@ angle::Result ProgramExecutableVk::createPipelineLayout(
             const uint32_t binding = mVariableInfoMap.getEmulatedXfbBufferBinding(bufferIndex);
             ASSERT(binding != std::numeric_limits<uint32_t>::max());
 
-            mDefaultUniformAndXfbSetDesc.update(binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
-                                                VK_SHADER_STAGE_VERTEX_BIT, nullptr);
+            mDefaultUniformAndXfbSetDesc.addBinding(binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                                                    VK_SHADER_STAGE_VERTEX_BIT, nullptr);
         }
     }
 
@@ -1682,7 +1627,7 @@ angle::Result ProgramExecutableVk::createPipelineLayout(
     // Decide if we should use dynamic or fixed descriptor types.
     VkPhysicalDeviceLimits limits = context->getRenderer()->getPhysicalDeviceProperties().limits;
     uint32_t totalDynamicUniformBufferCount =
-        numActiveUniformBufferDescriptors + mNumDefaultUniformDescriptors;
+        numActiveUniformBufferDescriptors + numDefaultUniformDescriptors;
     if (totalDynamicUniformBufferCount <= limits.maxDescriptorSetUniformBuffersDynamic)
     {
         mUniformBufferDescriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
@@ -1813,8 +1758,8 @@ angle::Result ProgramExecutableVk::getOrAllocateDescriptorSet(
     if (*newSharedCacheKeyOut != nullptr)
     {
         // Cache miss. A new cache entry has been created.
-        descriptorSetDesc.updateDescriptorSet(context, writeDescriptorDescs, updateBuilder,
-                                              mDescriptorSets[setIndex]);
+        descriptorSetDesc.updateDescriptorSet(context->getRenderer(), writeDescriptorDescs,
+                                              updateBuilder, mDescriptorSets[setIndex]);
     }
     else
     {
@@ -1874,7 +1819,6 @@ angle::Result ProgramExecutableVk::updateTexturesDescriptorSet(
     vk::Context *context,
     const gl::ActiveTextureArray<TextureVk *> &textures,
     const gl::SamplerBindingVector &samplers,
-    bool emulateSeamfulCubeMapSampling,
     PipelineType pipelineType,
     UpdateDescriptorSetsBuilder *updateBuilder,
     vk::CommandBufferHelperCommon *commandBufferHelper,
@@ -1895,9 +1839,9 @@ angle::Result ProgramExecutableVk::updateTexturesDescriptorSet(
         // Cache miss. A new cache entry has been created.
         ANGLE_TRY(fullDesc.updateFullActiveTextures(
             context, mVariableInfoMap, mTextureWriteDescriptorDescs, *mExecutable, textures,
-            samplers, emulateSeamfulCubeMapSampling, pipelineType, newSharedCacheKey));
-        fullDesc.updateDescriptorSet(context, mTextureWriteDescriptorDescs, updateBuilder,
-                                     mDescriptorSets[DescriptorSetIndex::Texture]);
+            samplers, pipelineType, newSharedCacheKey));
+        fullDesc.updateDescriptorSet(context->getRenderer(), mTextureWriteDescriptorDescs,
+                                     updateBuilder, mDescriptorSets[DescriptorSetIndex::Texture]);
     }
     else
     {
@@ -2005,7 +1949,7 @@ angle::Result ProgramExecutableVk::updateUniforms(
     bool isTransformFeedbackActiveUnpaused,
     TransformFeedbackVk *transformFeedbackVk)
 {
-    ASSERT(hasDirtyUniforms());
+    ASSERT(mDefaultUniformBlocksDirty.any());
 
     vk::BufferHelper *defaultUniformBuffer;
     bool anyNewBufferAllocated          = false;
@@ -2111,6 +2055,8 @@ void ProgramExecutableVk::onProgramBind()
     // current uniform buffer is still the same buffer we last time used and buffer has not been
     // recycled. But statistics gathered on gfxbench shows that app always update uniform data on
     // program bind anyway, so not really worth it to add more tracking logic here.
+    //
+    // Note: if this is changed, PPO uniform checks need to be updated as well
     setAllDefaultUniformsDirty();
 }
 
@@ -2137,123 +2083,28 @@ angle::Result ProgramExecutableVk::resizeUniformBlockMemory(
     return angle::Result::Continue;
 }
 
-template <typename T>
-void ProgramExecutableVk::setUniformImpl(GLint location,
-                                         GLsizei count,
-                                         const T *v,
-                                         GLenum entryPointType)
-{
-    const gl::VariableLocation &locationInfo = mExecutable->getUniformLocations()[location];
-    const gl::LinkedUniform &linkedUniform   = mExecutable->getUniforms()[locationInfo.index];
-
-    ASSERT(!linkedUniform.isSampler());
-
-    if (linkedUniform.pod.type == entryPointType)
-    {
-        for (const gl::ShaderType shaderType : mExecutable->getLinkedShaderStages())
-        {
-            DefaultUniformBlockVk &uniformBlock   = *mDefaultUniformBlocks[shaderType];
-            const sh::BlockMemberInfo &layoutInfo = uniformBlock.uniformLayout[location];
-
-            // Assume an offset of -1 means the block is unused.
-            if (layoutInfo.offset == -1)
-            {
-                continue;
-            }
-
-            const GLint componentCount = linkedUniform.getElementComponents();
-            UpdateDefaultUniformBlock(count, locationInfo.arrayIndex, componentCount, v, layoutInfo,
-                                      &uniformBlock.uniformData);
-            mDefaultUniformBlocksDirty.set(shaderType);
-        }
-    }
-    else
-    {
-        for (const gl::ShaderType shaderType : mExecutable->getLinkedShaderStages())
-        {
-            DefaultUniformBlockVk &uniformBlock   = *mDefaultUniformBlocks[shaderType];
-            const sh::BlockMemberInfo &layoutInfo = uniformBlock.uniformLayout[location];
-
-            // Assume an offset of -1 means the block is unused.
-            if (layoutInfo.offset == -1)
-            {
-                continue;
-            }
-
-            const GLint componentCount = linkedUniform.getElementComponents();
-
-            ASSERT(linkedUniform.pod.type == gl::VariableBoolVectorType(entryPointType));
-
-            GLint initialArrayOffset =
-                locationInfo.arrayIndex * layoutInfo.arrayStride + layoutInfo.offset;
-            for (GLint i = 0; i < count; i++)
-            {
-                GLint elementOffset = i * layoutInfo.arrayStride + initialArrayOffset;
-                GLint *dst =
-                    reinterpret_cast<GLint *>(uniformBlock.uniformData.data() + elementOffset);
-                const T *source = v + i * componentCount;
-
-                for (int c = 0; c < componentCount; c++)
-                {
-                    dst[c] = (source[c] == static_cast<T>(0)) ? GL_FALSE : GL_TRUE;
-                }
-            }
-
-            mDefaultUniformBlocksDirty.set(shaderType);
-        }
-    }
-}
-
-template <typename T>
-void ProgramExecutableVk::getUniformImpl(GLint location, T *v, GLenum entryPointType) const
-{
-    const gl::VariableLocation &locationInfo = mExecutable->getUniformLocations()[location];
-    const gl::LinkedUniform &linkedUniform   = mExecutable->getUniforms()[locationInfo.index];
-
-    ASSERT(!linkedUniform.isSampler() && !linkedUniform.isImage());
-
-    const gl::ShaderType shaderType = linkedUniform.getFirstActiveShaderType();
-    ASSERT(shaderType != gl::ShaderType::InvalidEnum);
-
-    const DefaultUniformBlockVk &uniformBlock = *mDefaultUniformBlocks[shaderType];
-    const sh::BlockMemberInfo &layoutInfo     = uniformBlock.uniformLayout[location];
-
-    ASSERT(gl::GetUniformTypeInfo(linkedUniform.pod.type).componentType == entryPointType ||
-           gl::GetUniformTypeInfo(linkedUniform.pod.type).componentType ==
-               gl::VariableBoolVectorType(entryPointType));
-
-    if (gl::IsMatrixType(linkedUniform.getType()))
-    {
-        const uint8_t *ptrToElement = uniformBlock.uniformData.data() + layoutInfo.offset +
-                                      (locationInfo.arrayIndex * layoutInfo.arrayStride);
-        GetMatrixUniform(linkedUniform.getType(), v, reinterpret_cast<const T *>(ptrToElement),
-                         false);
-    }
-    else
-    {
-        ReadFromDefaultUniformBlock(linkedUniform.getElementComponents(), locationInfo.arrayIndex,
-                                    v, layoutInfo, &uniformBlock.uniformData);
-    }
-}
-
 void ProgramExecutableVk::setUniform1fv(GLint location, GLsizei count, const GLfloat *v)
 {
-    setUniformImpl(location, count, v, GL_FLOAT);
+    SetUniform(mExecutable, location, count, v, GL_FLOAT, &mDefaultUniformBlocks,
+               &mDefaultUniformBlocksDirty);
 }
 
 void ProgramExecutableVk::setUniform2fv(GLint location, GLsizei count, const GLfloat *v)
 {
-    setUniformImpl(location, count, v, GL_FLOAT_VEC2);
+    SetUniform(mExecutable, location, count, v, GL_FLOAT_VEC2, &mDefaultUniformBlocks,
+               &mDefaultUniformBlocksDirty);
 }
 
 void ProgramExecutableVk::setUniform3fv(GLint location, GLsizei count, const GLfloat *v)
 {
-    setUniformImpl(location, count, v, GL_FLOAT_VEC3);
+    SetUniform(mExecutable, location, count, v, GL_FLOAT_VEC3, &mDefaultUniformBlocks,
+               &mDefaultUniformBlocksDirty);
 }
 
 void ProgramExecutableVk::setUniform4fv(GLint location, GLsizei count, const GLfloat *v)
 {
-    setUniformImpl(location, count, v, GL_FLOAT_VEC4);
+    SetUniform(mExecutable, location, count, v, GL_FLOAT_VEC4, &mDefaultUniformBlocks,
+               &mDefaultUniformBlocksDirty);
 }
 
 void ProgramExecutableVk::setUniform1iv(GLint location, GLsizei count, const GLint *v)
@@ -2267,70 +2118,50 @@ void ProgramExecutableVk::setUniform1iv(GLint location, GLsizei count, const GLi
         return;
     }
 
-    setUniformImpl(location, count, v, GL_INT);
+    SetUniform(mExecutable, location, count, v, GL_INT, &mDefaultUniformBlocks,
+               &mDefaultUniformBlocksDirty);
 }
 
 void ProgramExecutableVk::setUniform2iv(GLint location, GLsizei count, const GLint *v)
 {
-    setUniformImpl(location, count, v, GL_INT_VEC2);
+    SetUniform(mExecutable, location, count, v, GL_INT_VEC2, &mDefaultUniformBlocks,
+               &mDefaultUniformBlocksDirty);
 }
 
 void ProgramExecutableVk::setUniform3iv(GLint location, GLsizei count, const GLint *v)
 {
-    setUniformImpl(location, count, v, GL_INT_VEC3);
+    SetUniform(mExecutable, location, count, v, GL_INT_VEC3, &mDefaultUniformBlocks,
+               &mDefaultUniformBlocksDirty);
 }
 
 void ProgramExecutableVk::setUniform4iv(GLint location, GLsizei count, const GLint *v)
 {
-    setUniformImpl(location, count, v, GL_INT_VEC4);
+    SetUniform(mExecutable, location, count, v, GL_INT_VEC4, &mDefaultUniformBlocks,
+               &mDefaultUniformBlocksDirty);
 }
 
 void ProgramExecutableVk::setUniform1uiv(GLint location, GLsizei count, const GLuint *v)
 {
-    setUniformImpl(location, count, v, GL_UNSIGNED_INT);
+    SetUniform(mExecutable, location, count, v, GL_UNSIGNED_INT, &mDefaultUniformBlocks,
+               &mDefaultUniformBlocksDirty);
 }
 
 void ProgramExecutableVk::setUniform2uiv(GLint location, GLsizei count, const GLuint *v)
 {
-    setUniformImpl(location, count, v, GL_UNSIGNED_INT_VEC2);
+    SetUniform(mExecutable, location, count, v, GL_UNSIGNED_INT_VEC2, &mDefaultUniformBlocks,
+               &mDefaultUniformBlocksDirty);
 }
 
 void ProgramExecutableVk::setUniform3uiv(GLint location, GLsizei count, const GLuint *v)
 {
-    setUniformImpl(location, count, v, GL_UNSIGNED_INT_VEC3);
+    SetUniform(mExecutable, location, count, v, GL_UNSIGNED_INT_VEC3, &mDefaultUniformBlocks,
+               &mDefaultUniformBlocksDirty);
 }
 
 void ProgramExecutableVk::setUniform4uiv(GLint location, GLsizei count, const GLuint *v)
 {
-    setUniformImpl(location, count, v, GL_UNSIGNED_INT_VEC4);
-}
-
-template <int cols, int rows>
-void ProgramExecutableVk::setUniformMatrixfv(GLint location,
-                                             GLsizei count,
-                                             GLboolean transpose,
-                                             const GLfloat *value)
-{
-    const gl::VariableLocation &locationInfo = mExecutable->getUniformLocations()[location];
-    const gl::LinkedUniform &linkedUniform   = mExecutable->getUniforms()[locationInfo.index];
-
-    for (const gl::ShaderType shaderType : mExecutable->getLinkedShaderStages())
-    {
-        DefaultUniformBlockVk &uniformBlock   = *mDefaultUniformBlocks[shaderType];
-        const sh::BlockMemberInfo &layoutInfo = uniformBlock.uniformLayout[location];
-
-        // Assume an offset of -1 means the block is unused.
-        if (layoutInfo.offset == -1)
-        {
-            continue;
-        }
-
-        SetFloatUniformMatrixGLSL<cols, rows>::Run(
-            locationInfo.arrayIndex, linkedUniform.getBasicTypeElementCount(), count, transpose,
-            value, uniformBlock.uniformData.data() + layoutInfo.offset);
-
-        mDefaultUniformBlocksDirty.set(shaderType);
-    }
+    SetUniform(mExecutable, location, count, v, GL_UNSIGNED_INT_VEC4, &mDefaultUniformBlocks,
+               &mDefaultUniformBlocksDirty);
 }
 
 void ProgramExecutableVk::setUniformMatrix2fv(GLint location,
@@ -2338,7 +2169,8 @@ void ProgramExecutableVk::setUniformMatrix2fv(GLint location,
                                               GLboolean transpose,
                                               const GLfloat *value)
 {
-    setUniformMatrixfv<2, 2>(location, count, transpose, value);
+    SetUniformMatrixfv<2, 2>(mExecutable, location, count, transpose, value, &mDefaultUniformBlocks,
+                             &mDefaultUniformBlocksDirty);
 }
 
 void ProgramExecutableVk::setUniformMatrix3fv(GLint location,
@@ -2346,7 +2178,8 @@ void ProgramExecutableVk::setUniformMatrix3fv(GLint location,
                                               GLboolean transpose,
                                               const GLfloat *value)
 {
-    setUniformMatrixfv<3, 3>(location, count, transpose, value);
+    SetUniformMatrixfv<3, 3>(mExecutable, location, count, transpose, value, &mDefaultUniformBlocks,
+                             &mDefaultUniformBlocksDirty);
 }
 
 void ProgramExecutableVk::setUniformMatrix4fv(GLint location,
@@ -2354,7 +2187,8 @@ void ProgramExecutableVk::setUniformMatrix4fv(GLint location,
                                               GLboolean transpose,
                                               const GLfloat *value)
 {
-    setUniformMatrixfv<4, 4>(location, count, transpose, value);
+    SetUniformMatrixfv<4, 4>(mExecutable, location, count, transpose, value, &mDefaultUniformBlocks,
+                             &mDefaultUniformBlocksDirty);
 }
 
 void ProgramExecutableVk::setUniformMatrix2x3fv(GLint location,
@@ -2362,7 +2196,8 @@ void ProgramExecutableVk::setUniformMatrix2x3fv(GLint location,
                                                 GLboolean transpose,
                                                 const GLfloat *value)
 {
-    setUniformMatrixfv<2, 3>(location, count, transpose, value);
+    SetUniformMatrixfv<2, 3>(mExecutable, location, count, transpose, value, &mDefaultUniformBlocks,
+                             &mDefaultUniformBlocksDirty);
 }
 
 void ProgramExecutableVk::setUniformMatrix3x2fv(GLint location,
@@ -2370,7 +2205,8 @@ void ProgramExecutableVk::setUniformMatrix3x2fv(GLint location,
                                                 GLboolean transpose,
                                                 const GLfloat *value)
 {
-    setUniformMatrixfv<3, 2>(location, count, transpose, value);
+    SetUniformMatrixfv<3, 2>(mExecutable, location, count, transpose, value, &mDefaultUniformBlocks,
+                             &mDefaultUniformBlocksDirty);
 }
 
 void ProgramExecutableVk::setUniformMatrix2x4fv(GLint location,
@@ -2378,7 +2214,8 @@ void ProgramExecutableVk::setUniformMatrix2x4fv(GLint location,
                                                 GLboolean transpose,
                                                 const GLfloat *value)
 {
-    setUniformMatrixfv<2, 4>(location, count, transpose, value);
+    SetUniformMatrixfv<2, 4>(mExecutable, location, count, transpose, value, &mDefaultUniformBlocks,
+                             &mDefaultUniformBlocksDirty);
 }
 
 void ProgramExecutableVk::setUniformMatrix4x2fv(GLint location,
@@ -2386,7 +2223,8 @@ void ProgramExecutableVk::setUniformMatrix4x2fv(GLint location,
                                                 GLboolean transpose,
                                                 const GLfloat *value)
 {
-    setUniformMatrixfv<4, 2>(location, count, transpose, value);
+    SetUniformMatrixfv<4, 2>(mExecutable, location, count, transpose, value, &mDefaultUniformBlocks,
+                             &mDefaultUniformBlocksDirty);
 }
 
 void ProgramExecutableVk::setUniformMatrix3x4fv(GLint location,
@@ -2394,7 +2232,8 @@ void ProgramExecutableVk::setUniformMatrix3x4fv(GLint location,
                                                 GLboolean transpose,
                                                 const GLfloat *value)
 {
-    setUniformMatrixfv<3, 4>(location, count, transpose, value);
+    SetUniformMatrixfv<3, 4>(mExecutable, location, count, transpose, value, &mDefaultUniformBlocks,
+                             &mDefaultUniformBlocksDirty);
 }
 
 void ProgramExecutableVk::setUniformMatrix4x3fv(GLint location,
@@ -2402,27 +2241,28 @@ void ProgramExecutableVk::setUniformMatrix4x3fv(GLint location,
                                                 GLboolean transpose,
                                                 const GLfloat *value)
 {
-    setUniformMatrixfv<4, 3>(location, count, transpose, value);
+    SetUniformMatrixfv<4, 3>(mExecutable, location, count, transpose, value, &mDefaultUniformBlocks,
+                             &mDefaultUniformBlocksDirty);
 }
 
 void ProgramExecutableVk::getUniformfv(const gl::Context *context,
                                        GLint location,
                                        GLfloat *params) const
 {
-    getUniformImpl(location, params, GL_FLOAT);
+    GetUniform(mExecutable, location, params, GL_FLOAT, &mDefaultUniformBlocks);
 }
 
 void ProgramExecutableVk::getUniformiv(const gl::Context *context,
                                        GLint location,
                                        GLint *params) const
 {
-    getUniformImpl(location, params, GL_INT);
+    GetUniform(mExecutable, location, params, GL_INT, &mDefaultUniformBlocks);
 }
 
 void ProgramExecutableVk::getUniformuiv(const gl::Context *context,
                                         GLint location,
                                         GLuint *params) const
 {
-    getUniformImpl(location, params, GL_UNSIGNED_INT);
+    GetUniform(mExecutable, location, params, GL_UNSIGNED_INT, &mDefaultUniformBlocks);
 }
 }  // namespace rx

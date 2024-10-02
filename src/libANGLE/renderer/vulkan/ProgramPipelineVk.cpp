@@ -105,16 +105,12 @@ angle::Result ProgramPipelineVk::link(const gl::Context *glContext,
 
     if (contextVk->getFeatures().warmUpPipelineCacheAtLink.enabled)
     {
-        ANGLE_TRY(executableVk->warmUpPipelineCache(
-            contextVk->getRenderer(), contextVk->pipelineRobustness(),
-            contextVk->pipelineProtectedAccess(), vk::GraphicsPipelineSubset::Complete));
+        ANGLE_TRY(executableVk->warmUpPipelineCache(contextVk->getRenderer(),
+                                                    contextVk->pipelineRobustness(),
+                                                    contextVk->pipelineProtectedAccess()));
     }
 
     return result;
 }  // namespace rx
 
-void ProgramPipelineVk::onProgramUniformUpdate(gl::ShaderType shaderType)
-{
-    getExecutable()->mDefaultUniformBlocksDirty.set(shaderType);
-}
 }  // namespace rx

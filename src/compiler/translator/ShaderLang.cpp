@@ -200,6 +200,7 @@ void InitBuiltInResources(ShBuiltInResources *resources)
     resources->EXT_geometry_shader                            = 0;
     resources->OES_geometry_shader                            = 0;
     resources->EXT_gpu_shader5                                = 0;
+    resources->OES_gpu_shader5                                = 0;
     resources->OES_shader_io_blocks                           = 0;
     resources->EXT_shader_io_blocks                           = 0;
     resources->EXT_shader_non_constant_global_initializers    = 0;
@@ -215,11 +216,13 @@ void InitBuiltInResources(ShBuiltInResources *resources)
     resources->APPLE_clip_distance                            = 0;
     resources->OES_texture_cube_map_array                     = 0;
     resources->EXT_texture_cube_map_array                     = 0;
+    resources->EXT_texture_shadow_lod                         = 0;
     resources->EXT_shadow_samplers                            = 0;
     resources->OES_shader_multisample_interpolation           = 0;
     resources->NV_draw_buffers                                = 0;
     resources->OES_shader_image_atomic                        = 0;
     resources->EXT_tessellation_shader                        = 0;
+    resources->OES_tessellation_shader                        = 0;
     resources->OES_texture_buffer                             = 0;
     resources->EXT_texture_buffer                             = 0;
     resources->OES_sample_variables                           = 0;
@@ -249,6 +252,7 @@ void InitBuiltInResources(ShBuiltInResources *resources)
     resources->HashFunction = nullptr;
 
     resources->MaxExpressionComplexity = 256;
+    resources->MaxStatementDepth       = 256;
     resources->MaxCallStackDepth       = 256;
     resources->MaxFunctionParameters   = 1024;
 

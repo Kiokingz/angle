@@ -18,6 +18,7 @@
 #include <thread>
 
 #include "common/PackedEnums.h"
+#include "common/SimpleMutex.h"
 #include "common/WorkerThread.h"
 #include "common/angleutils.h"
 #include "common/vulkan/vk_headers.h"
@@ -125,7 +126,7 @@ class OneOffCommandPool : angle::NonCopyable
 
   private:
     vk::ProtectionType mProtectionType;
-    std::mutex mMutex;
+    angle::SimpleMutex mMutex;
     vk::CommandPool mCommandPool;
     struct PendingOneOffCommands
     {
@@ -135,7 +136,7 @@ class OneOffCommandPool : angle::NonCopyable
     std::deque<PendingOneOffCommands> mPendingCommands;
 };
 
-enum class UseValidationLayers
+enum class UseDebugLayers
 {
     Yes,
     YesIfAvailable,
@@ -159,7 +160,7 @@ class Renderer : angle::NonCopyable
                              angle::vk::ICD desiredICD,
                              uint32_t preferredVendorId,
                              uint32_t preferredDeviceId,
-                             UseValidationLayers useValidationLayers,
+                             UseDebugLayers useDebugLayers,
                              const char *wsiExtension,
                              const char *wsiLayer,
                              angle::NativeWindowSystem nativeWindowSystem,
@@ -227,6 +228,15 @@ class Renderer : angle::NonCopyable
     {
         return mQueueFamilyProperties[mCurrentQueueFamilyIndex];
     }
+    const DeviceQueueIndex getDeviceQueueIndex(egl::ContextPriority priority) const
+    {
+        return mCommandQueue.getDeviceQueueIndex(priority);
+    }
+    const DeviceQueueIndex getDefaultDeviceQueueIndex() const
+    {
+        // By default it will always use medium priority
+        return mCommandQueue.getDeviceQueueIndex(egl::ContextPriority::Medium);
+    }
 
     const vk::MemoryProperties &getMemoryProperties() const { return mMemoryProperties; }
 
@@ -237,7 +247,13 @@ class Renderer : angle::NonCopyable
 
     const vk::Format &getFormat(angle::FormatID formatID) const { return mFormatTable[formatID]; }
 
-    angle::Result getPipelineCacheSize(vk::Context *context, size_t *pipelineCacheSizeOut);
+    // Get the pipeline cache data after retrieving the size, but only if the size is increased
+    // since last query.  This function should be called with the |mPipelineCacheMutex| lock already
+    // held.
+    angle::Result getLockedPipelineCacheDataIfNew(vk::Context *context,
+                                                  size_t *pipelineCacheSizeOut,
+                                                  size_t lastSyncSize,
+                                                  std::vector<uint8_t> *pipelineCacheDataOut);
     angle::Result syncPipelineCacheVk(vk::Context *context,
                                       vk::GlobalOps *globalOps,
                                       const gl::Context *contextGL);
@@ -267,16 +283,15 @@ class Renderer : angle::NonCopyable
                                     const VkFormatFeatureFlags featureBits) const;
 
     bool isAsyncCommandQueueEnabled() const { return mFeatures.asyncCommandQueue.enabled; }
-    bool isAsyncCommandBufferResetEnabled() const
+    bool isAsyncCommandBufferResetAndGarbageCleanupEnabled() const
     {
-        return mFeatures.asyncCommandBufferReset.enabled;
+        return mFeatures.asyncCommandBufferResetAndGarbageCleanup.enabled;
     }
 
     ANGLE_INLINE egl::ContextPriority getDriverPriority(egl::ContextPriority priority)
     {
         return mCommandQueue.getDriverPriority(priority);
     }
-    ANGLE_INLINE uint32_t getDeviceQueueIndex() { return mCommandQueue.getDeviceQueueIndex(); }
 
     VkQueue getQueue(egl::ContextPriority priority) { return mCommandQueue.getQueue(priority); }
 
@@ -338,6 +353,7 @@ class Renderer : angle::NonCopyable
         mSuballocationGarbageList.add(this, std::move(garbage));
     }
 
+    size_t getNextPipelineCacheBlobCacheSlotIndex(size_t *previousSlotIndexOut);
     angle::Result getPipelineCache(vk::Context *context, vk::PipelineCacheAccess *pipelineCacheOut);
     angle::Result mergeIntoPipelineCache(vk::Context *context,
                                          const vk::PipelineCache &pipelineCache);
@@ -503,15 +519,28 @@ class Renderer : angle::NonCopyable
     // Accumulate cache stats for a specific cache
     void accumulateCacheStats(VulkanCacheType cache, const CacheStats &stats)
     {
-        std::unique_lock<std::mutex> localLock(mCacheStatsMutex);
+        std::unique_lock<angle::SimpleMutex> localLock(mCacheStatsMutex);
         mVulkanCacheStats[cache].accumulate(stats);
     }
     // Log cache stats for all caches
     void logCacheStats() const;
 
-    VkPipelineStageFlags getSupportedVulkanPipelineStageMask() const
+    VkPipelineStageFlags getSupportedBufferWritePipelineStageMask() const
     {
-        return mSupportedVulkanPipelineStageMask;
+        return mSupportedBufferWritePipelineStageMask;
+    }
+
+    VkPipelineStageFlags getPipelineStageMask(EventStage eventStage) const
+    {
+        return mEventStageAndPipelineStageFlagsMap[eventStage];
+    }
+    VkPipelineStageFlags getEventPipelineStageMask(const RefCountedEvent &refCountedEvent) const
+    {
+        return mEventStageAndPipelineStageFlagsMap[refCountedEvent.getEventStage()];
+    }
+    const ImageMemoryBarrierData &getImageMemoryBarrierData(ImageLayout layout) const
+    {
+        return mImageLayoutAndMemoryBarrierDataMap[layout];
     }
 
     VkShaderStageFlags getSupportedVulkanShaderStageMask() const
@@ -552,9 +581,9 @@ class Renderer : angle::NonCopyable
     }
     size_t getStagingBufferAlignment() const { return mStagingBufferAlignment; }
 
-    uint32_t getVertexConversionBufferMemoryTypeIndex(vk::MemoryHostVisibility hostVisibility) const
+    uint32_t getVertexConversionBufferMemoryTypeIndex(MemoryHostVisibility hostVisibility) const
     {
-        return hostVisibility == vk::MemoryHostVisibility::Visible
+        return hostVisibility == MemoryHostVisibility::Visible
                    ? mHostVisibleVertexConversionBufferMemoryTypeIndex
                    : mDeviceLocalVertexConversionBufferMemoryTypeIndex;
     }
@@ -739,6 +768,16 @@ class Renderer : angle::NonCopyable
         return mPipelineCacheGraphDumpPath.c_str();
     }
 
+    vk::RefCountedEventRecycler *getRefCountedEventRecycler() { return &mRefCountedEventRecycler; }
+
+    std::thread::id getCommandProcessorThreadId() const { return mCommandProcessor.getThreadId(); }
+
+    vk::RefCountedDescriptorSetLayout *getDescriptorLayoutForEmptyDesc()
+    {
+        ASSERT(mPlaceHolderDescriptorSetLayout && mPlaceHolderDescriptorSetLayout->get().valid());
+        return mPlaceHolderDescriptorSetLayout;
+    }
+
   private:
     angle::Result setupDevice(vk::Context *context,
                               const angle::FeatureOverrides &featureOverrides,
@@ -781,7 +820,6 @@ class Renderer : angle::NonCopyable
     void enableDeviceExtensionsPromotedTo12(const vk::ExtensionNameList &deviceExtensionNames);
     void enableDeviceExtensionsPromotedTo13(const vk::ExtensionNameList &deviceExtensionNames);
 
-    void initInstanceExtensionEntryPoints();
     void initDeviceExtensionEntryPoints();
     // Initialize extension entry points from core ones if needed
     void initializeInstanceExtensionEntryPointsFromCore() const;
@@ -883,8 +921,6 @@ class Renderer : angle::NonCopyable
     VkDeviceDeviceMemoryReportCreateInfoEXT mMemoryReportCallback;
     VkPhysicalDeviceShaderFloat16Int8FeaturesKHR mShaderFloat16Int8Features;
     VkPhysicalDeviceDepthStencilResolvePropertiesKHR mDepthStencilResolveProperties;
-    VkPhysicalDeviceMultisampledRenderToSingleSampledFeaturesGOOGLEX
-        mMultisampledRenderToSingleSampledFeaturesGOOGLEX;
     VkPhysicalDeviceMultisampledRenderToSingleSampledFeaturesEXT
         mMultisampledRenderToSingleSampledFeatures;
     VkPhysicalDeviceImage2DViewOf3DFeaturesEXT mImage2dViewOf3dFeatures;
@@ -897,6 +933,7 @@ class Renderer : angle::NonCopyable
     VkPhysicalDeviceHostQueryResetFeaturesEXT mHostQueryResetFeatures;
     VkPhysicalDeviceDepthClampZeroOneFeaturesEXT mDepthClampZeroOneFeatures;
     VkPhysicalDeviceDepthClipControlFeaturesEXT mDepthClipControlFeatures;
+    VkPhysicalDeviceBlendOperationAdvancedFeaturesEXT mBlendOperationAdvancedFeatures;
     VkPhysicalDevicePrimitivesGeneratedQueryFeaturesEXT mPrimitivesGeneratedQueryFeatures;
     VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT mPrimitiveTopologyListRestartFeatures;
     VkPhysicalDeviceSamplerYcbcrConversionFeatures mSamplerYcbcrConversionFeatures;
@@ -905,6 +942,8 @@ class Renderer : angle::NonCopyable
     VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT mGraphicsPipelineLibraryFeatures;
     VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT mGraphicsPipelineLibraryProperties;
     VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT mVertexInputDynamicStateFeatures;
+    VkPhysicalDeviceDynamicRenderingFeaturesKHR mDynamicRenderingFeatures;
+    VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR mDynamicRenderingLocalReadFeatures;
     VkPhysicalDeviceFragmentShadingRateFeaturesKHR mFragmentShadingRateFeatures;
     VkPhysicalDeviceFragmentShadingRatePropertiesKHR mFragmentShadingRateProperties;
     VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT mFragmentShaderInterlockFeatures;
@@ -913,6 +952,8 @@ class Renderer : angle::NonCopyable
     VkPhysicalDevicePipelineProtectedAccessFeaturesEXT mPipelineProtectedAccessFeatures;
     VkPhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT
         mRasterizationOrderAttachmentAccessFeatures;
+    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT mShaderAtomicFloatFeatures;
+    VkPhysicalDeviceMaintenance5FeaturesKHR mMaintenance5Features;
     VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT mSwapchainMaintenance1Features;
     VkPhysicalDeviceLegacyDitheringFeaturesEXT mDitheringFeatures;
     VkPhysicalDeviceDrmPropertiesEXT mDrmProperties;
@@ -925,6 +966,13 @@ class Renderer : angle::NonCopyable
     VkPhysicalDeviceExternalFormatResolveFeaturesANDROID mExternalFormatResolveFeatures;
     VkPhysicalDeviceExternalFormatResolvePropertiesANDROID mExternalFormatResolveProperties;
 #endif
+    VkPhysicalDevice8BitStorageFeatures m8BitStorageFeatures;
+    VkPhysicalDevice16BitStorageFeatures m16BitStorageFeatures;
+    VkPhysicalDeviceSynchronization2Features mSynchronization2Features;
+    VkPhysicalDeviceVariablePointersFeatures mVariablePointersFeatures;
+    VkPhysicalDeviceFloatControlsProperties mFloatControlProperties;
+
+    uint32_t mLegacyDitheringVersion = 0;
 
     angle::PackedEnumBitSet<gl::ShadingRate, uint8_t> mSupportedFragmentShadingRates;
     angle::PackedEnumMap<gl::ShadingRate, VkSampleCountFlags>
@@ -945,6 +993,8 @@ class Renderer : angle::NonCopyable
     vk::SharedGarbageList<vk::BufferSuballocationGarbage> mSuballocationGarbageList;
     // Holds orphaned BufferBlocks when ShareGroup gets destroyed
     vk::BufferBlockGarbageList mOrphanedBufferBlockList;
+    // Holds RefCountedEvent that are free and ready to reuse
+    vk::RefCountedEventRecycler mRefCountedEventRecycler;
 
     VkDeviceSize mPendingGarbageSizeLimit;
 
@@ -976,8 +1026,9 @@ class Renderer : angle::NonCopyable
     //    requires external synchronization when mPipelineCache is the dstCache of
     //    vkMergePipelineCaches. Lock the mutex if mergeProgramPipelineCachesToGlobalCache is
     //    enabled
-    std::mutex mPipelineCacheMutex;
+    angle::SimpleMutex mPipelineCacheMutex;
     vk::PipelineCache mPipelineCache;
+    size_t mCurrentPipelineCacheBlobCacheSlotIndex;
     uint32_t mPipelineCacheVkUpdateTimeout;
     size_t mPipelineCacheSizeAtLastSync;
     std::atomic<bool> mPipelineCacheInitialized;
@@ -1020,7 +1071,7 @@ class Renderer : angle::NonCopyable
     SamplerYcbcrConversionCache mYuvConversionCache;
     angle::HashMap<VkFormat, uint32_t> mVkFormatDescriptorCountMap;
     vk::ActiveHandleCounter mActiveHandleCounts;
-    std::mutex mActiveHandleCountsMutex;
+    angle::SimpleMutex mActiveHandleCountsMutex;
 
     // Tracks resource serials.
     vk::ResourceSerialFactory mResourceSerialFactory;
@@ -1038,7 +1089,7 @@ class Renderer : angle::NonCopyable
 
     // Stats about all Vulkan object caches
     VulkanCacheStats mVulkanCacheStats;
-    mutable std::mutex mCacheStatsMutex;
+    mutable angle::SimpleMutex mCacheStatsMutex;
 
     // A mask to filter out Vulkan pipeline stages that are not supported, applied in situations
     // where multiple stages are prespecified (for example with image layout transitions):
@@ -1051,8 +1102,11 @@ class Renderer : angle::NonCopyable
     // Note that this mask can have bits set that don't correspond to valid stages, so it's
     // strictly only useful for masking out unsupported stages in an otherwise valid set of
     // stages.
-    VkPipelineStageFlags mSupportedVulkanPipelineStageMask;
+    VkPipelineStageFlags mSupportedBufferWritePipelineStageMask;
     VkShaderStageFlags mSupportedVulkanShaderStageMask;
+    // The 1:1 mapping between EventStage and VkPipelineStageFlags
+    angle::PackedEnumMap<EventStage, VkPipelineStageFlags> mEventStageAndPipelineStageFlagsMap;
+    angle::PackedEnumMap<ImageLayout, ImageMemoryBarrierData> mImageLayoutAndMemoryBarrierDataMap;
 
     // Use thread pool to compress cache data.
     std::shared_ptr<angle::WaitableEvent> mCompressEvent;
@@ -1071,6 +1125,9 @@ class Renderer : angle::NonCopyable
     std::ostringstream mPipelineCacheGraph;
     bool mDumpPipelineCacheGraph;
     std::string mPipelineCacheGraphDumpPath;
+
+    // A placeholder descriptor set layout handle for layouts with no bindings.
+    vk::RefCountedDescriptorSetLayout *mPlaceHolderDescriptorSetLayout;
 };
 
 ANGLE_INLINE Serial Renderer::generateQueueSerial(SerialIndex index)

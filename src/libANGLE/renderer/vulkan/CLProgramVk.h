@@ -8,6 +8,8 @@
 #ifndef LIBANGLE_RENDERER_VULKAN_CLPROGRAMVK_H_
 #define LIBANGLE_RENDERER_VULKAN_CLPROGRAMVK_H_
 
+#include "common/SimpleMutex.h"
+
 #include "libANGLE/renderer/vulkan/CLContextVk.h"
 #include "libANGLE/renderer/vulkan/CLKernelVk.h"
 #include "libANGLE/renderer/vulkan/cl_types.h"
@@ -40,9 +42,10 @@ class CLProgramVk : public CLProgramImpl
         angle::HashMap<uint32_t, CLKernelVk::ArgInfo> kernelArgInfos;
         angle::HashMap<std::string, uint32_t> kernelFlags;
         angle::HashMap<std::string, std::string> kernelAttributes;
-        angle::HashMap<std::string, std::array<uint32_t, 3>> kernelCompileWGS;
+        angle::HashMap<std::string, std::array<uint32_t, 3>> kernelCompileWorkgroupSize;
         angle::HashMap<uint32_t, VkPushConstantRange> pushConstants;
-        std::array<uint32_t, 3> specConstantWorkgroupSizeIDs{0, 0, 0};
+        angle::PackedEnumMap<SpecConstantType, uint32_t> specConstantIDs;
+        angle::PackedEnumBitSet<SpecConstantType, uint32_t> specConstantsUsed;
         CLKernelArgsMap kernelArgsMap;
     };
 
@@ -136,17 +139,18 @@ class CLProgramVk : public CLProgramImpl
             return kargsCopy;
         }
 
-        cl::WorkgroupSize getCompiledWGS(const std::string &kernelName) const
+        cl::WorkgroupSize getCompiledWorkgroupSize(const std::string &kernelName) const
         {
-            cl::WorkgroupSize compiledWGS{0, 0, 0};
-            if (reflectionData.kernelCompileWGS.contains(kernelName))
+            cl::WorkgroupSize compiledWorkgroupSize{0, 0, 0};
+            if (reflectionData.kernelCompileWorkgroupSize.contains(kernelName))
             {
-                for (size_t i = 0; i < compiledWGS.size(); ++i)
+                for (size_t i = 0; i < compiledWorkgroupSize.size(); ++i)
                 {
-                    compiledWGS[i] = reflectionData.kernelCompileWGS.at(kernelName)[i];
+                    compiledWorkgroupSize[i] =
+                        reflectionData.kernelCompileWorkgroupSize.at(kernelName)[i];
                 }
             }
-            return compiledWGS;
+            return compiledWorkgroupSize;
         }
 
         std::string getKernelAttributes(const std::string &kernelName) const
@@ -179,6 +183,30 @@ class CLProgramVk : public CLProgramImpl
         {
             return getPushConstantRangeFromClspvReflectionType(
                 NonSemanticClspvReflectionPushConstantGlobalSize);
+        }
+
+        inline const VkPushConstantRange *getEnqueuedLocalSizeRange() const
+        {
+            return getPushConstantRangeFromClspvReflectionType(
+                NonSemanticClspvReflectionPushConstantEnqueuedLocalSize);
+        }
+
+        inline const VkPushConstantRange *getNumWorkgroupsRange() const
+        {
+            return getPushConstantRangeFromClspvReflectionType(
+                NonSemanticClspvReflectionPushConstantNumWorkgroups);
+        }
+
+        inline const VkPushConstantRange *getRegionOffsetRange() const
+        {
+            return getPushConstantRangeFromClspvReflectionType(
+                NonSemanticClspvReflectionPushConstantRegionOffset);
+        }
+
+        inline const VkPushConstantRange *getRegionGroupOffsetRange() const
+        {
+            return getPushConstantRangeFromClspvReflectionType(
+                NonSemanticClspvReflectionPushConstantRegionGroupOffset);
         }
     };
     using DevicePrograms   = angle::HashMap<const _cl_device_id *, DeviceProgramData>;
@@ -236,6 +264,9 @@ class CLProgramVk : public CLProgramImpl
     angle::Result allocateDescriptorSet(const vk::DescriptorSetLayout &descriptorSetLayout,
                                         VkDescriptorSet *descriptorSetOut);
 
+    // Sets the status for given associated device programs
+    void setBuildStatus(const cl::DevicePtrs &devices, cl_build_status status);
+
   private:
     CLContextVk *mContext;
     std::string mProgramOpts;
@@ -246,7 +277,7 @@ class CLProgramVk : public CLProgramImpl
     DescriptorSetLayoutCache mDescSetLayoutCache;
     vk::DescriptorSetArray<vk::DescriptorPoolPointer> mDescriptorPools;
     vk::RefCountedDescriptorPoolBinding mPoolBinding;
-    std::mutex mProgramMutex;
+    angle::SimpleMutex mProgramMutex;
 };
 
 class CLAsyncBuildTask : public angle::Closure

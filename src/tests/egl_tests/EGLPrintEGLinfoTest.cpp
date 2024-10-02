@@ -11,10 +11,10 @@
 
 #include "common/string_utils.h"
 #include "test_utils/ANGLETest.h"
-#include "test_utils/runner/TestSuite.h"
 
 #if defined(ANGLE_HAS_RAPIDJSON)
 #    include "common/serializer/JsonSerializer.h"
+#    include "test_utils/runner/TestSuite.h"
 #endif  // defined(ANGLE_HAS_RAPIDJSON)
 
 using namespace angle;
@@ -144,8 +144,11 @@ TEST_P(EGLPrintEGLinfoTest, PrintGLInfo)
 
     {
         std::vector<uint8_t> jsonData = json.getData();
-        SaveFileHelper saveFile(artifactPath);
-        saveFile.write(jsonData.data(), jsonData.size());
+
+        FILE *fp = fopen(artifactPath.c_str(), "wb");
+        ASSERT(fp);
+        fwrite(jsonData.data(), sizeof(uint8_t), jsonData.size(), fp);
+        fclose(fp);
     }
 #endif  // defined(ANGLE_HAS_RAPIDJSON)
 }
@@ -531,7 +534,8 @@ ANGLE_INSTANTIATE_TEST(EGLPrintEGLinfoTest,
                        ES2_VULKAN(),
                        ES3_VULKAN(),
                        ES32_VULKAN(),
-                       ES31_VULKAN_SWIFTSHADER());
+                       ES31_VULKAN_SWIFTSHADER(),
+                       ES32_EGL());
 
 // This test suite is not instantiated on some OSes.
 GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(EGLPrintEGLinfoTest);

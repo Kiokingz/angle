@@ -13,6 +13,7 @@
 
 #include "common/Color.h"
 #include "common/FixedVector.h"
+#include "common/SimpleMutex.h"
 #include "common/WorkerThread.h"
 #include "libANGLE/Uniform.h"
 #include "libANGLE/renderer/vulkan/ShaderInterfaceVariableInfoMap.h"
@@ -39,6 +40,7 @@ class UpdateDescriptorSetsBuilder;
 // - Set 1 contains all textures (including texture buffers).
 // - Set 2 contains all other shader resources, such as uniform and storage blocks, atomic counter
 //   buffers, images and image buffers.
+// - Set 3 reserved for OpenCL
 
 enum class DescriptorSetIndex : uint32_t
 {
@@ -47,7 +49,13 @@ enum class DescriptorSetIndex : uint32_t
     Texture        = 1,         // Textures set index
     ShaderResource = 2,         // Other shader resources set index
 
-    InvalidEnum = 3,
+    // CL specific naming for set indices
+    LiteralSampler  = 0,
+    KernelArguments = 1,
+    ModuleConstants = 2,
+    Printf          = 3,
+
+    InvalidEnum = 4,
     EnumCount   = InvalidEnum,
 };
 
@@ -59,6 +67,8 @@ class SamplerHelper;
 enum class ImageLayout;
 class PipelineCacheAccess;
 class RenderPassCommandBufferHelper;
+class PackedClearValuesArray;
+class AttachmentOpsArray;
 
 using RefCountedDescriptorSetLayout    = AtomicRefCounted<DescriptorSetLayout>;
 using RefCountedPipelineLayout         = AtomicRefCounted<PipelineLayout>;
@@ -131,6 +141,8 @@ template <typename T>
 using FramebufferNonResolveAttachmentArray = std::array<T, kMaxFramebufferNonResolveAttachments>;
 using FramebufferNonResolveAttachmentMask  = angle::BitSet16<kMaxFramebufferNonResolveAttachments>;
 
+class PackedAttachmentIndex;
+
 class alignas(4) RenderPassDesc final
 {
   public:
@@ -166,6 +178,8 @@ class alignas(4) RenderPassDesc final
     void packStencilUnresolveAttachment();
     void removeDepthStencilUnresolveAttachment();
 
+    PackedAttachmentIndex getPackedColorAttachmentIndex(size_t colorIndexGL);
+
     void setWriteControlMode(gl::SrgbWriteControlMode mode);
 
     size_t hash() const;
@@ -177,8 +191,6 @@ class alignas(4) RenderPassDesc final
     bool isColorAttachmentEnabled(size_t colorIndexGL) const;
     bool hasYUVResolveAttachment() const { return mIsYUVResolve; }
     bool hasDepthStencilAttachment() const;
-    bool hasDepthAttachment() const;
-    bool hasStencilAttachment() const;
     gl::DrawBufferMask getColorResolveAttachmentMask() const { return mColorResolveAttachmentMask; }
     bool hasColorResolveAttachment(size_t colorIndexGL) const
     {
@@ -237,6 +249,39 @@ class alignas(4) RenderPassDesc final
         ASSERT(index < gl::IMPLEMENTATION_MAX_DRAW_BUFFERS + 1);
         return static_cast<angle::FormatID>(mAttachmentFormats[index]);
     }
+
+    // Start a render pass with a render pass object.
+    void beginRenderPass(Context *context,
+                         PrimaryCommandBuffer *primary,
+                         const RenderPass &renderPass,
+                         VkFramebuffer framebuffer,
+                         const gl::Rectangle &renderArea,
+                         VkSubpassContents subpassContents,
+                         PackedClearValuesArray &clearValues,
+                         const VkRenderPassAttachmentBeginInfo *attachmentBeginInfo) const;
+
+    // Start a render pass with dynamic rendering.
+    void beginRendering(Context *context,
+                        PrimaryCommandBuffer *primary,
+                        const gl::Rectangle &renderArea,
+                        VkSubpassContents subpassContents,
+                        const FramebufferAttachmentsVector<VkImageView> &attachmentViews,
+                        const AttachmentOpsArray &ops,
+                        PackedClearValuesArray &clearValues,
+                        uint32_t layerCount) const;
+
+    void populateRenderingInheritanceInfo(
+        Renderer *renderer,
+        VkCommandBufferInheritanceRenderingInfo *infoOut,
+        gl::DrawBuffersArray<VkFormat> *colorFormatStorageOut) const;
+
+    // Calculate perf counters for a dynamic rendering render pass instance.  For render pass
+    // objects, the perf counters are updated when creating the render pass, where access to
+    // ContextVk is available.
+    void updatePerfCounters(Context *context,
+                            const FramebufferAttachmentsVector<VkImageView> &attachmentViews,
+                            const AttachmentOpsArray &ops,
+                            angle::VulkanPerfCounters *countersOut);
 
   private:
     uint8_t mSamples;
@@ -348,7 +393,7 @@ struct PackedAttachmentOpsDesc final
     // so that the resolve attachment's storeOp can be set to DONT_CARE if the attachment is
     // invalidated, and if possible removed from the list of resolve attachments altogether.  Note
     // that the latter may not be possible if the render pass has multiple subpasses due to Vulkan
-    // render pass compatibility rules.
+    // render pass compatibility rules (not an issue with dynamic rendering).
     uint16_t isInvalidated : 1;
     uint16_t isStencilInvalidated : 1;
     uint16_t padding1 : 6;
@@ -357,12 +402,11 @@ struct PackedAttachmentOpsDesc final
     // placed at the beginning of that enum.
     uint16_t initialLayout : 5;
     uint16_t finalLayout : 5;
-    uint16_t padding2 : 6;
+    uint16_t finalResolveLayout : 5;
+    uint16_t padding2 : 1;
 };
 
 static_assert(sizeof(PackedAttachmentOpsDesc) == 4, "Size check failed");
-
-class PackedAttachmentIndex;
 
 class AttachmentOpsArray final
 {
@@ -986,12 +1030,11 @@ class GraphicsPipelineDesc final
 constexpr size_t kGraphicsPipelineDescSize = sizeof(GraphicsPipelineDesc);
 static_assert(kGraphicsPipelineDescSize == kGraphicsPipelineDescSumOfSizes, "Size mismatch");
 
-constexpr uint32_t kMaxDescriptorSetLayoutBindings =
-    std::max(gl::IMPLEMENTATION_MAX_ACTIVE_TEXTURES,
-             gl::IMPLEMENTATION_MAX_UNIFORM_BUFFER_BINDINGS);
-
+// Values are based on data recorded here -> https://anglebug.com/42267114#comment5
+constexpr size_t kDefaultDescriptorSetLayoutBindingsCount = 8;
+constexpr size_t kDefaultImmutableSamplerBindingsCount    = 1;
 using DescriptorSetLayoutBindingVector =
-    angle::FixedVector<VkDescriptorSetLayoutBinding, kMaxDescriptorSetLayoutBindings>;
+    angle::FastVector<VkDescriptorSetLayoutBinding, kDefaultDescriptorSetLayoutBindingsCount>;
 
 // A packed description of a descriptor set layout. Use similarly to RenderPassDesc and
 // GraphicsPipelineDesc. Currently we only need to differentiate layouts based on sampler and ubo
@@ -1007,47 +1050,66 @@ class DescriptorSetLayoutDesc final
     size_t hash() const;
     bool operator==(const DescriptorSetLayoutDesc &other) const;
 
-    void update(uint32_t bindingIndex,
-                VkDescriptorType descriptorType,
-                uint32_t count,
-                VkShaderStageFlags stages,
-                const Sampler *immutableSampler);
+    void addBinding(uint32_t bindingIndex,
+                    VkDescriptorType descriptorType,
+                    uint32_t count,
+                    VkShaderStageFlags stages,
+                    const Sampler *immutableSampler);
 
-    void unpackBindings(DescriptorSetLayoutBindingVector *bindings,
-                        std::vector<VkSampler> *immutableSamplers) const;
+    void unpackBindings(DescriptorSetLayoutBindingVector *bindings) const;
 
-    bool empty() const { return *this == DescriptorSetLayoutDesc(); }
+    bool empty() const { return mDescriptorSetLayoutBindings.empty(); }
 
   private:
     // There is a small risk of an issue if the sampler cache is evicted but not the descriptor
     // cache we would have an invalid handle here. Thus propose follow-up work:
     // TODO: https://issuetracker.google.com/issues/159156775: Have immutable sampler use serial
-    struct PackedDescriptorSetBinding
+    union PackedDescriptorSetBinding
     {
-        uint8_t type;    // Stores a packed VkDescriptorType descriptorType.
-        uint8_t stages;  // Stores a packed VkShaderStageFlags.
-        uint16_t count;  // Stores a packed uint32_t descriptorCount.
-        uint32_t pad;
-        VkSampler immutableSampler;
+        static constexpr uint8_t kInvalidType = 255;
+
+        struct
+        {
+            uint8_t type;                      // Stores a packed VkDescriptorType descriptorType.
+            uint8_t stages;                    // Stores a packed VkShaderStageFlags.
+            uint16_t count : 15;               // Stores a packed uint32_t descriptorCount
+            uint16_t hasImmutableSampler : 1;  // Whether this binding has an immutable sampler
+        };
+        uint32_t value;
+
+        bool operator==(const PackedDescriptorSetBinding &other) const
+        {
+            return value == other.value;
+        }
     };
 
-    // 4x 32bit
-    static_assert(sizeof(PackedDescriptorSetBinding) == 16, "Unexpected size");
+    // 1x 32bit
+    static_assert(sizeof(PackedDescriptorSetBinding) == 4, "Unexpected size");
 
-    // This is a compact representation of a descriptor set layout.
-    std::array<PackedDescriptorSetBinding, kMaxDescriptorSetLayoutBindings>
-        mPackedDescriptorSetLayout;
+    angle::FastVector<VkSampler, kDefaultImmutableSamplerBindingsCount> mImmutableSamplers;
+    angle::FastVector<PackedDescriptorSetBinding, kDefaultDescriptorSetLayoutBindingsCount>
+        mDescriptorSetLayoutBindings;
+
+#if !defined(ANGLE_IS_64_BIT_CPU)
+    ANGLE_MAYBE_UNUSED_PRIVATE_FIELD uint32_t mPadding = 0;
+#endif
 };
 
 // The following are for caching descriptor set layouts. Limited to max three descriptor set
 // layouts. This can be extended in the future.
-constexpr size_t kMaxDescriptorSetLayouts = 3;
+constexpr size_t kMaxDescriptorSetLayouts = ToUnderlying(DescriptorSetIndex::EnumCount);
 
-struct PackedPushConstantRange
+union PackedPushConstantRange
 {
-    uint8_t offset;
-    uint8_t size;
-    uint16_t stageMask;
+    struct
+    {
+        uint8_t offset;
+        uint8_t size;
+        uint16_t stageMask;
+    };
+    uint32_t value;
+
+    bool operator==(const PackedPushConstantRange &other) const { return value == other.value; }
 };
 
 static_assert(sizeof(PackedPushConstantRange) == sizeof(uint32_t), "Unexpected Size");
@@ -1295,7 +1357,7 @@ class PipelineCacheAccess
     PipelineCacheAccess()  = default;
     ~PipelineCacheAccess() = default;
 
-    void init(const vk::PipelineCache *pipelineCache, std::mutex *mutex)
+    void init(const vk::PipelineCache *pipelineCache, angle::SimpleMutex *mutex)
     {
         mPipelineCache = pipelineCache;
         mMutex         = mutex;
@@ -1308,19 +1370,21 @@ class PipelineCacheAccess
                                    const VkComputePipelineCreateInfo &createInfo,
                                    vk::Pipeline *pipelineOut);
 
+    VkResult getCacheData(vk::Context *context, size_t *cacheSize, void *cacheData);
+
     void merge(Renderer *renderer, const vk::PipelineCache &pipelineCache);
 
     bool isThreadSafe() const { return mMutex != nullptr; }
 
   private:
-    std::unique_lock<std::mutex> getLock();
+    std::unique_lock<angle::SimpleMutex> getLock();
 
     const vk::PipelineCache *mPipelineCache = nullptr;
-    std::mutex *mMutex;
+    angle::SimpleMutex *mMutex;
 };
 
 // Monolithic pipeline creation tasks are created as soon as a pipeline is created out of libraries.
-// However, they are not immediately posted to the worker queue to allow pacing.  One each use of a
+// However, they are not immediately posted to the worker queue to allow pacing.  On each use of a
 // pipeline, an attempt is made to post the task.
 class CreateMonolithicPipelineTask : public Context, public angle::Closure
 {
@@ -1336,6 +1400,8 @@ class CreateMonolithicPipelineTask : public Context, public angle::Closure
     // render pass cache may have been cleared since the task was created (e.g. to accomodate
     // framebuffer fetch).  Such render pass cache clears ensure there are no active tasks, so it's
     // safe to hold on to this pointer for the brief period between task post and completion.
+    //
+    // Not applicable to dynamic rendering.
     const RenderPassDesc &getRenderPassDesc() const { return mDesc.getRenderPassDesc(); }
     void setCompatibleRenderPass(const RenderPass *compatibleRenderPass);
 
@@ -1475,7 +1541,7 @@ class PipelineHelper final : public Resource
     // If pipeline libraries are used and monolithic pipelines are created in parallel, this is the
     // temporary library created (previously in |mPipeline|) that is now replaced by the monolithic
     // one.  It is not immediately garbage collected when replaced, because there is currently a bug
-    // with that.  http://anglebug.com/7862
+    // with that.  http://anglebug.com/42266335
     Pipeline mLinkedPipelineToRelease;
 
     // An async task to create a monolithic pipeline.  Only used if the pipeline was originally
@@ -1723,7 +1789,7 @@ class DescriptorSetDesc
         return mDescriptorInfos[infoDescIndex];
     }
 
-    void updateDescriptorSet(Context *context,
+    void updateDescriptorSet(Renderer *renderer,
                              const WriteDescriptorDescs &writeDescriptorDescs,
                              UpdateDescriptorSetsBuilder *updateBuilder,
                              const DescriptorDescHandles *handles,
@@ -1802,8 +1868,7 @@ class DescriptorSetDescBuilder final
 
     // Specific helpers for shader resource descriptors.
     template <typename CommandBufferT>
-    void updateOneShaderBuffer(ContextVk *contextVk,
-                               CommandBufferT *commandBufferHelper,
+    void updateOneShaderBuffer(CommandBufferT *commandBufferHelper,
                                const ShaderInterfaceVariableInfoMap &variableInfoMap,
                                const gl::BufferVector &buffers,
                                const gl::InterfaceBlock &block,
@@ -1811,10 +1876,10 @@ class DescriptorSetDescBuilder final
                                VkDescriptorType descriptorType,
                                VkDeviceSize maxBoundBufferRange,
                                const BufferHelper &emptyBuffer,
-                               const WriteDescriptorDescs &writeDescriptorDescs);
+                               const WriteDescriptorDescs &writeDescriptorDescs,
+                               const GLbitfield memoryBarrierBits);
     template <typename CommandBufferT>
-    void updateShaderBuffers(ContextVk *contextVk,
-                             CommandBufferT *commandBufferHelper,
+    void updateShaderBuffers(CommandBufferT *commandBufferHelper,
                              const gl::ProgramExecutable &executable,
                              const ShaderInterfaceVariableInfoMap &variableInfoMap,
                              const gl::BufferVector &buffers,
@@ -1822,10 +1887,10 @@ class DescriptorSetDescBuilder final
                              VkDescriptorType descriptorType,
                              VkDeviceSize maxBoundBufferRange,
                              const BufferHelper &emptyBuffer,
-                             const WriteDescriptorDescs &writeDescriptorDescs);
+                             const WriteDescriptorDescs &writeDescriptorDescs,
+                             const GLbitfield memoryBarrierBits);
     template <typename CommandBufferT>
-    void updateAtomicCounters(ContextVk *contextVk,
-                              CommandBufferT *commandBufferHelper,
+    void updateAtomicCounters(CommandBufferT *commandBufferHelper,
                               const gl::ProgramExecutable &executable,
                               const ShaderInterfaceVariableInfoMap &variableInfoMap,
                               const gl::BufferVector &buffers,
@@ -1856,11 +1921,10 @@ class DescriptorSetDescBuilder final
                                            const gl::ProgramExecutable &executable,
                                            const gl::ActiveTextureArray<TextureVk *> &textures,
                                            const gl::SamplerBindingVector &samplers,
-                                           bool emulateSeamfulCubeMapSampling,
                                            PipelineType pipelineType,
                                            const SharedDescriptorSetCacheKey &sharedCacheKey);
 
-    void updateDescriptorSet(Context *context,
+    void updateDescriptorSet(Renderer *renderer,
                              const WriteDescriptorDescs &writeDescriptorDescs,
                              UpdateDescriptorSetsBuilder *updateBuilder,
                              VkDescriptorSet descriptorSet) const;
@@ -1963,6 +2027,8 @@ class FramebufferDesc
     // Note: this is an exclusive index. If there is one index it will be "1".
     // Maximum value is 18
     uint16_t mMaxIndex : 5;
+
+    // Whether the render pass has input attachments or not.
     uint16_t mHasFramebufferFetch : 1;
     static_assert(gl::IMPLEMENTATION_MAX_FRAMEBUFFER_LAYERS < (1 << 9) - 1,
                   "Not enough bits for mLayerCount");
@@ -2556,8 +2622,12 @@ class DescriptorSetLayoutCache final : angle::NonCopyable
         const vk::DescriptorSetLayoutDesc &desc,
         vk::AtomicBindingPointer<vk::DescriptorSetLayout> *descriptorSetLayoutOut);
 
+    // Helpers for white box tests
+    size_t getCacheHitCount() const { return mCacheStats.getHitCount(); }
+    size_t getCacheMissCount() const { return mCacheStats.getMissCount(); }
+
   private:
-    mutable std::mutex mMutex;
+    mutable angle::SimpleMutex mMutex;
     std::unordered_map<vk::DescriptorSetLayoutDesc, vk::RefCountedDescriptorSetLayout> mPayload;
     CacheStats mCacheStats;
 };
@@ -2577,7 +2647,7 @@ class PipelineLayoutCache final : public HasCacheStats<VulkanCacheType::Pipeline
         vk::AtomicBindingPointer<vk::PipelineLayout> *pipelineLayoutOut);
 
   private:
-    mutable std::mutex mMutex;
+    mutable angle::SimpleMutex mMutex;
     std::unordered_map<vk::PipelineLayoutDesc, vk::RefCountedPipelineLayout> mPayload;
 };
 

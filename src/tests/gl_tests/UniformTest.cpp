@@ -327,7 +327,7 @@ class UniformTest : public ANGLETest<>
 
     void testSetUp() override
     {
-        // TODO(anglebug.com/5505): asserting with latest direct-to-Metal compiler
+        // TODO(anglebug.com/40096755): asserting with latest direct-to-Metal compiler
         // changes. Must skip all tests explicitly.
         // if (IsMetal())
         //    return;
@@ -1540,6 +1540,48 @@ void main()
     ASSERT_NE(mProgram, 0u);
     drawQuad(mProgram, "position", 0.5f);
     EXPECT_PIXEL_COLOR_EQ(0, 0, GLColor::green);
+}
+
+// Regression test for D3D11 packing of 3x3 matrices followed by a single float. The setting of the
+// matrix would overwrite the float which is packed right after. http://anglebug.com/42266878,
+// http://crbug.com/345525082
+TEST_P(UniformTestES3, ExpandedFloatMatrix3Packing)
+{
+    constexpr char vs[] = R"(precision highp float;
+attribute vec4 position;
+void main()
+{
+    gl_Position = position;
+})";
+
+    constexpr char fs[] = R"(precision mediump float;
+struct s
+{
+    mat3 umat3;
+    float ufloat;
+};
+uniform s u;
+void main() {
+    gl_FragColor = vec4(u.umat3[0][0], u.ufloat, 1.0, 1.0);
+})";
+
+    ANGLE_GL_PROGRAM(program, vs, fs);
+    glUseProgram(program);
+
+    GLint umat3Location = glGetUniformLocation(program, "u.umat3");
+    ASSERT_NE(umat3Location, -1);
+
+    GLint ufloatLocation = glGetUniformLocation(program, "u.ufloat");
+    ASSERT_NE(ufloatLocation, -1);
+
+    constexpr GLfloat mat3[9] = {
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    };
+
+    glUniform1f(ufloatLocation, 1.0f);
+    glUniformMatrix3fv(umat3Location, 1, GL_FALSE, mat3);
+    drawQuad(program, "position", 0.5f);
+    EXPECT_PIXEL_COLOR_EQ(0, 0, GLColor(0, 255, 255, 255));
 }
 
 // Use this to select which configurations (e.g. which renderer, which GLES major version) these

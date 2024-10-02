@@ -153,13 +153,9 @@ constexpr state::ExtendedDirtyBits kReadInvalidateExtendedDirtyBits{};
 constexpr state::DirtyBits kDrawInvalidateDirtyBits{state::DIRTY_BIT_DRAW_FRAMEBUFFER_BINDING};
 constexpr state::ExtendedDirtyBits kDrawInvalidateExtendedDirtyBits{};
 
-// The implementation's internal load/store programs for EXT_shader_pixel_pixel_local_storage
-// only need the draw framebuffer to be synced. The remaining state is managed internally.
-constexpr state::DirtyBits kPixelLocalStorageEXTEnableDisableDirtyBits{
-    state::DIRTY_BIT_DRAW_FRAMEBUFFER_BINDING};
-constexpr state::ExtendedDirtyBits kPixelLocalStorageEXTEnableDisableExtendedDirtyBits{};
-constexpr state::DirtyObjects kPixelLocalStorageEXTEnableDisableDirtyObjects{
-    state::DIRTY_OBJECT_DRAW_FRAMEBUFFER};
+constexpr state::DirtyBits kTilingDirtyBits{state::DIRTY_BIT_DRAW_FRAMEBUFFER_BINDING};
+constexpr state::ExtendedDirtyBits kTilingExtendedDirtyBits{};
+constexpr state::DirtyObjects kTilingDirtyObjects{state::DIRTY_OBJECT_DRAW_FRAMEBUFFER};
 
 egl::ShareGroup *AllocateOrGetShareGroup(egl::Display *display, const gl::Context *shareContext)
 {
@@ -596,7 +592,8 @@ Context::Context(egl::Display *display,
              memoryProgramCache != nullptr,
              GetContextPriority(attribs),
              GetRobustAccess(attribs),
-             GetProtectedContent(attribs)),
+             GetProtectedContent(attribs),
+             GetIsExternal(attribs)),
       mShared(shareContext != nullptr || shareTextures != nullptr || shareSemaphores != nullptr),
       mDisplayTextureShareGroup(shareTextures != nullptr),
       mDisplaySemaphoreShareGroup(shareSemaphores != nullptr),
@@ -624,7 +621,6 @@ Context::Context(egl::Display *display,
       mFrameCapture(new angle::FrameCapture),
       mRefCount(0),
       mOverlay(mImplementation.get()),
-      mIsExternal(GetIsExternal(attribs)),
       mIsDestroyed(false)
 {
     for (angle::SubjectIndex uboIndex = kUniformBuffer0SubjectIndex;
@@ -664,7 +660,21 @@ Context::Context(egl::Display *display,
 egl::Error Context::initialize()
 {
     if (!mImplementation)
+    {
         return egl::Error(EGL_NOT_INITIALIZED, "native context creation failed");
+    }
+
+    // If the final context version created (with backwards compatibility possibly added in),
+    // generate an error if it's higher than the maximum supported version for the display. This
+    // validation is always done even with EGL validation disabled because it's not possible to
+    // detect ahead of time if an ES 3.1 context is supported (no ES_31_BIT) or if
+    // KHR_no_config_context is used.
+    if (getClientType() == EGL_OPENGL_ES_API &&
+        getClientVersion() > getDisplay()->getMaxSupportedESVersion())
+    {
+        return egl::Error(EGL_BAD_ATTRIBUTE, "Requested version is not supported");
+    }
+
     return egl::NoError();
 }
 
@@ -811,8 +821,6 @@ void Context::initializeDefaultResources()
     mComputeDirtyObjects |= kComputeDirtyObjectsBase;
     mCopyImageDirtyBits |= kCopyImageDirtyBitsBase;
     mCopyImageDirtyObjects |= kCopyImageDirtyObjectsBase;
-    mPixelLocalStorageEXTEnableDisableDirtyObjects |=
-        kPixelLocalStorageEXTEnableDisableDirtyObjects;
 
     mOverlay.init();
 }
@@ -850,7 +858,7 @@ egl::Error Context::onDestroy(const egl::Display *display)
     mDefaultFramebuffer->onDestroy(this);
     mDefaultFramebuffer.reset();
 
-    for (auto fence : mFenceNVMap)
+    for (auto fence : UnsafeResourceMapIter(mFenceNVMap))
     {
         if (fence.second)
         {
@@ -860,7 +868,7 @@ egl::Error Context::onDestroy(const egl::Display *display)
     }
     mFenceNVMap.clear();
 
-    for (auto query : mQueryMap)
+    for (auto query : UnsafeResourceMapIter(mQueryMap))
     {
         if (query.second != nullptr)
         {
@@ -869,7 +877,7 @@ egl::Error Context::onDestroy(const egl::Display *display)
     }
     mQueryMap.clear();
 
-    for (auto vertexArray : mVertexArrayMap)
+    for (auto vertexArray : UnsafeResourceMapIter(mVertexArrayMap))
     {
         if (vertexArray.second)
         {
@@ -878,7 +886,7 @@ egl::Error Context::onDestroy(const egl::Display *display)
     }
     mVertexArrayMap.clear();
 
-    for (auto transformFeedback : mTransformFeedbackMap)
+    for (auto transformFeedback : UnsafeResourceMapIter(mTransformFeedbackMap))
     {
         if (transformFeedback.second != nullptr)
         {
@@ -1221,7 +1229,7 @@ void Context::deleteSemaphore(SemaphoreID semaphore)
 void Context::loseContext(GraphicsResetStatus current, GraphicsResetStatus other)
 {
     // TODO(geofflang): mark the rest of the share group lost. Requires access to the entire share
-    // group from a context. http://anglebug.com/3379
+    // group from a context. http://anglebug.com/42262046
     markContextLost(current);
 }
 
@@ -1454,6 +1462,7 @@ void Context::bindReadFramebuffer(FramebufferID framebufferHandle)
 
 void Context::bindDrawFramebuffer(FramebufferID framebufferHandle)
 {
+    endTilingImplicit();
     Framebuffer *framebuffer = mState.mFramebufferManager->checkFramebufferAllocation(
         mImplementation.get(), this, framebufferHandle);
     mState.setDrawFramebufferBinding(framebuffer);
@@ -1784,6 +1793,13 @@ void Context::getFloatvImpl(GLenum pname, GLfloat *params) const
         case GL_SMOOTH_LINE_WIDTH_RANGE:
             params[0] = mState.getCaps().minSmoothLineWidth;
             params[1] = mState.getCaps().maxSmoothLineWidth;
+            break;
+        case GL_MULTISAMPLE_LINE_WIDTH_RANGE:
+            params[0] = mState.getCaps().minMultisampleLineWidth;
+            params[1] = mState.getCaps().maxMultisampleLineWidth;
+            break;
+        case GL_MULTISAMPLE_LINE_WIDTH_GRANULARITY:
+            *params = mState.getCaps().lineWidthGranularity;
             break;
         case GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT:
             ASSERT(mState.getExtensions().textureFilterAnisotropicEXT);
@@ -3611,14 +3627,15 @@ void Context::beginTransformFeedback(PrimitiveMode primitiveMode)
     ASSERT(transformFeedback != nullptr);
     ASSERT(!transformFeedback->isPaused());
 
-    // TODO: http://anglebug.com/7232: Handle PPOs
+    // TODO: http://anglebug.com/42265705: Handle PPOs
     ANGLE_CONTEXT_TRY(transformFeedback->begin(this, primitiveMode, mState.getProgram()));
     mStateCache.onActiveTransformFeedbackChange(this);
 }
 
 bool Context::hasActiveTransformFeedback(ShaderProgramID program) const
 {
-    for (auto pair : mTransformFeedbackMap)
+    // Note: transform feedback objects are private to context and so the map doesn't need locking
+    for (auto pair : UnsafeResourceMapIter(mTransformFeedbackMap))
     {
         if (pair.second != nullptr && pair.second->hasBoundProgram(program))
         {
@@ -3655,6 +3672,7 @@ Extensions Context::generateSupportedExtensions() const
         supportedExtensions.multiviewMultisampleANGLE    = false;
         supportedExtensions.copyTexture3dANGLE           = false;
         supportedExtensions.textureMultisampleANGLE      = false;
+        supportedExtensions.textureShadowLodEXT          = false;
         supportedExtensions.textureStencil8OES           = false;
         supportedExtensions.conservativeDepthEXT         = false;
         supportedExtensions.drawBuffersIndexedEXT        = false;
@@ -3733,16 +3751,18 @@ Extensions Context::generateSupportedExtensions() const
         supportedExtensions.geometryShaderEXT       = false;
         supportedExtensions.geometryShaderOES       = false;
         supportedExtensions.gpuShader5EXT           = false;
+        supportedExtensions.gpuShader5OES           = false;
         supportedExtensions.primitiveBoundingBoxEXT = false;
         supportedExtensions.shaderImageAtomicOES    = false;
         supportedExtensions.shaderIoBlocksEXT       = false;
         supportedExtensions.shaderIoBlocksOES       = false;
         supportedExtensions.tessellationShaderEXT   = false;
+        supportedExtensions.tessellationShaderOES   = false;
         supportedExtensions.textureBufferEXT        = false;
         supportedExtensions.textureBufferOES        = false;
 
-        // TODO(http://anglebug.com/2775): Multisample arrays could be supported on ES 3.0 as well
-        // once 2D multisample texture extension is exposed there.
+        // TODO(http://anglebug.com/42261478): Multisample arrays could be supported on ES 3.0 as
+        // well once 2D multisample texture extension is exposed there.
         supportedExtensions.textureStorageMultisample2dArrayOES = false;
     }
 
@@ -3803,6 +3823,28 @@ Extensions Context::generateSupportedExtensions() const
     supportedExtensions.requestExtensionANGLE            = true;
     supportedExtensions.multiDrawANGLE                   = true;
     supportedExtensions.programBinaryReadinessQueryANGLE = true;
+
+    const Limitations &limitations                  = getLimitations();
+    const angle::FrontendFeatures &frontendFeatures = mDisplay->getFrontendFeatures();
+
+    if (limitations.multidrawEmulated &&
+        !frontendFeatures.alwaysEnableEmulatedMultidrawExtensions.enabled && !mWebGLContext)
+    {
+        supportedExtensions.multiDrawANGLE       = false;
+        supportedExtensions.multiDrawIndirectEXT = false;
+    }
+
+    if (limitations.baseInstanceBaseVertexEmulated &&
+        !frontendFeatures.alwaysEnableEmulatedMultidrawExtensions.enabled && !mWebGLContext)
+    {
+        supportedExtensions.baseVertexBaseInstanceANGLE = false;
+    }
+
+    if (limitations.baseInstanceEmulated &&
+        !frontendFeatures.alwaysEnableEmulatedMultidrawExtensions.enabled && !mWebGLContext)
+    {
+        supportedExtensions.baseInstanceEXT = false;
+    }
 
     // Enable the no error extension if the context was created with the flag.
     supportedExtensions.noErrorKHR = skipValidation();
@@ -3893,7 +3935,7 @@ void Context::initCaps()
     Caps *caps = mState.getMutableCaps();
     *caps      = mImplementation->getNativeCaps();
 
-    // TODO (http://anglebug.com/6010): mSupportedExtensions should not be modified here
+    // TODO (http://anglebug.com/42264543): mSupportedExtensions should not be modified here
     mSupportedExtensions = generateSupportedExtensions();
 
     if (!mDisplay->getFrontendFeatures().allowCompressedFormats.enabled)
@@ -4047,7 +4089,7 @@ void Context::initCaps()
     ANGLE_LIMIT_CAP(caps->maxTransformFeedbackSeparateComponents,
                     IMPLEMENTATION_MAX_TRANSFORM_FEEDBACK_SEPARATE_COMPONENTS);
 
-    if (getClientVersion() < ES_3_2 && !extensions->tessellationShaderEXT)
+    if (getClientVersion() < ES_3_2 && !extensions->tessellationShaderAny())
     {
         ANGLE_LIMIT_CAP(caps->maxCombinedTextureImageUnits,
                         IMPLEMENTATION_MAX_ES31_ACTIVE_TEXTURES);
@@ -4318,17 +4360,6 @@ void Context::initCaps()
                 caps->maxCombinedDrawBuffersAndPixelLocalStoragePlanes = maxDrawableAttachments;
                 break;
 
-            case ShPixelLocalStorageType::PixelLocalStorageEXT:
-                caps->maxPixelLocalStoragePlanes = caps->maxShaderPixelLocalStorageFastSizeEXT / 4;
-                ASSERT(caps->maxPixelLocalStoragePlanes >= 4);
-                ANGLE_LIMIT_CAP(caps->maxPixelLocalStoragePlanes,
-                                IMPLEMENTATION_MAX_PIXEL_LOCAL_STORAGE_PLANES);
-                // EXT_shader_pixel_local_storage doesn't support rendering to color attachments.
-                caps->maxColorAttachmentsWithActivePixelLocalStorage = 0;
-                caps->maxCombinedDrawBuffersAndPixelLocalStoragePlanes =
-                    caps->maxPixelLocalStoragePlanes;
-                break;
-
             case ShPixelLocalStorageType::NotSupported:
                 UNREACHABLE();
                 break;
@@ -4498,7 +4529,8 @@ void Context::updateCaps()
                                       (mState.isWebGL() || mState.hasRobustAccess()));
 
     // Cache this in the VertexArrays. They need to check it in state change notifications.
-    for (auto vaoIter : mVertexArrayMap)
+    // Note: vertex array objects are private to context and so the map doesn't need locking
+    for (auto vaoIter : UnsafeResourceMapIter(mVertexArrayMap))
     {
         VertexArray *vao = vaoIter.second;
         vao->setBufferAccessValidationEnabled(mBufferAccessValidationEnabled);
@@ -4676,16 +4708,14 @@ void Context::clear(GLbitfield mask)
 
     // If depth write is disabled, don't attempt to clear depth.
     if (mState.getDrawFramebuffer()->getDepthAttachment() == nullptr ||
-        !mState.getDepthStencilState().depthMask)
+        mState.getDepthStencilState().isDepthMaskedOut())
     {
         mask &= ~GL_DEPTH_BUFFER_BIT;
     }
 
     // If all stencil bits are masked, don't attempt to clear stencil.
-    if (mState.getDrawFramebuffer()->getStencilAttachment() == nullptr ||
-        (angle::BitMask<uint32_t>(
-             mState.getDrawFramebuffer()->getStencilAttachment()->getStencilSize()) &
-         mState.getDepthStencilState().stencilWritemask) == 0)
+    if (mState.getDepthStencilState().isStencilMaskedOut(
+            mState.getDrawFramebuffer()->getStencilBitCount()))
     {
         mask &= ~GL_STENCIL_BUFFER_BIT;
     }
@@ -4701,7 +4731,9 @@ void Context::clear(GLbitfield mask)
     ANGLE_CONTEXT_TRY(mState.getDrawFramebuffer()->clear(this, mask));
 }
 
-bool Context::isClearBufferMaskedOut(GLenum buffer, GLint drawbuffer) const
+bool Context::isClearBufferMaskedOut(GLenum buffer,
+                                     GLint drawbuffer,
+                                     GLuint framebufferStencilSize) const
 {
     switch (buffer)
     {
@@ -4710,10 +4742,10 @@ bool Context::isClearBufferMaskedOut(GLenum buffer, GLint drawbuffer) const
         case GL_DEPTH:
             return mState.getDepthStencilState().isDepthMaskedOut();
         case GL_STENCIL:
-            return mState.getDepthStencilState().isStencilMaskedOut();
+            return mState.getDepthStencilState().isStencilMaskedOut(framebufferStencilSize);
         case GL_DEPTH_STENCIL:
             return mState.getDepthStencilState().isDepthMaskedOut() &&
-                   mState.getDepthStencilState().isStencilMaskedOut();
+                   mState.getDepthStencilState().isStencilMaskedOut(framebufferStencilSize);
         default:
             UNREACHABLE();
             return true;
@@ -4725,7 +4757,8 @@ bool Context::noopClearBuffer(GLenum buffer, GLint drawbuffer) const
     Framebuffer *framebufferObject = mState.getDrawFramebuffer();
 
     return !IsClearBufferEnabled(framebufferObject->getState(), buffer, drawbuffer) ||
-           mState.isRasterizerDiscardEnabled() || isClearBufferMaskedOut(buffer, drawbuffer);
+           mState.isRasterizerDiscardEnabled() ||
+           isClearBufferMaskedOut(buffer, drawbuffer, framebufferObject->getStencilBitCount());
 }
 
 void Context::clearBufferfv(GLenum buffer, GLint drawbuffer, const GLfloat *values)
@@ -5749,7 +5782,7 @@ void *Context::mapBufferRange(BufferBinding target,
         return nullptr;
     }
 
-    // TODO: (anglebug.com/7821): Modify return value in entry point layer
+    // TODO: (anglebug.com/42266294): Modify return value in entry point layer
     angle::FrameCaptureShared *frameCaptureShared = getShareGroup()->getFrameCaptureShared();
     if (frameCaptureShared->enabled())
     {
@@ -7234,7 +7267,8 @@ void Context::shaderBinary(GLsizei n,
 {
     Shader *shaderObject = getShaderNoResolveCompile(*shaders);
     ASSERT(shaderObject != nullptr);
-    ANGLE_CONTEXT_TRY(shaderObject->loadShaderBinary(this, binary, length));
+    ANGLE_CONTEXT_TRY(
+        shaderObject->loadShaderBinary(this, binary, length, angle::JobResultExpectancy::Future));
 }
 
 void Context::bindFragDataLocationIndexed(ShaderProgramID program,
@@ -9325,6 +9359,16 @@ void Context::onUniformBlockBindingUpdated(GLuint uniformBlockIndex)
     mStateCache.onUniformBufferStateChange(this);
 }
 
+void Context::endTilingImplicit()
+{
+    if (getMutablePrivateState()->isTiledRendering())
+    {
+        ANGLE_PERF_WARNING(getState().getDebug(), GL_DEBUG_SEVERITY_LOW,
+                           "Implicitly ending tiled rendering due to framebuffer state change");
+        getMutablePrivateState()->setTiledRendering(false);
+    }
+}
+
 void Context::onSubjectStateChange(angle::SubjectIndex index, angle::SubjectMessage message)
 {
     switch (index)
@@ -9626,7 +9670,7 @@ egl::Error Context::releaseExternalContext()
     return egl::NoError();
 }
 
-std::mutex &Context::getProgramCacheMutex() const
+angle::SimpleMutex &Context::getProgramCacheMutex() const
 {
     return mDisplay->getProgramCacheMutex();
 }
@@ -9634,7 +9678,7 @@ std::mutex &Context::getProgramCacheMutex() const
 bool Context::supportsGeometryOrTesselation() const
 {
     return mState.getClientVersion() == ES_3_2 || mState.getExtensions().geometryShaderAny() ||
-           mState.getExtensions().tessellationShaderEXT;
+           mState.getExtensions().tessellationShaderAny();
 }
 
 void Context::dirtyAllState()
@@ -9649,11 +9693,17 @@ void Context::finishImmutable() const
     ANGLE_CONTEXT_TRY(mImplementation->finish(this));
 }
 
-void Context::beginPerfMonitor(GLuint monitor) {}
+void Context::beginPerfMonitor(GLuint monitor)
+{
+    getMutablePrivateState()->setPerfMonitorActive(true);
+}
 
 void Context::deletePerfMonitors(GLsizei n, GLuint *monitors) {}
 
-void Context::endPerfMonitor(GLuint monitor) {}
+void Context::endPerfMonitor(GLuint monitor)
+{
+    getMutablePrivateState()->setPerfMonitorActive(false);
+}
 
 void Context::genPerfMonitors(GLsizei n, GLuint *monitors)
 {
@@ -9838,29 +9888,6 @@ const angle::PerfMonitorCounterGroups &Context::getPerfMonitorCounterGroups() co
     return mImplementation->getPerfMonitorCounters();
 }
 
-void Context::drawPixelLocalStorageEXTEnable(GLsizei n,
-                                             const PixelLocalStoragePlane planes[],
-                                             const GLenum loadops[])
-{
-    ASSERT(mImplementation->getNativePixelLocalStorageOptions().type ==
-           ShPixelLocalStorageType::PixelLocalStorageEXT);
-    ANGLE_CONTEXT_TRY(syncState(kPixelLocalStorageEXTEnableDisableDirtyBits,
-                                kPixelLocalStorageEXTEnableDisableExtendedDirtyBits,
-                                mPixelLocalStorageEXTEnableDisableDirtyObjects, Command::Draw));
-    ANGLE_CONTEXT_TRY(mImplementation->drawPixelLocalStorageEXTEnable(this, n, planes, loadops));
-}
-
-void Context::drawPixelLocalStorageEXTDisable(const PixelLocalStoragePlane planes[],
-                                              const GLenum storeops[])
-{
-    ASSERT(mImplementation->getNativePixelLocalStorageOptions().type ==
-           ShPixelLocalStorageType::PixelLocalStorageEXT);
-    ANGLE_CONTEXT_TRY(syncState(kPixelLocalStorageEXTEnableDisableDirtyBits,
-                                kPixelLocalStorageEXTEnableDisableExtendedDirtyBits,
-                                mPixelLocalStorageEXTEnableDisableDirtyObjects, Command::Draw));
-    ANGLE_CONTEXT_TRY(mImplementation->drawPixelLocalStorageEXTDisable(this, planes, storeops));
-}
-
 void Context::framebufferFoveationConfig(FramebufferID framebufferPacked,
                                          GLuint numLayers,
                                          GLuint focalPointsPerLayer,
@@ -9910,6 +9937,73 @@ void Context::textureFoveationParameters(TextureID texturePacked,
     Texture *texture = getTexture(texturePacked);
     ASSERT(texture);
     texture->setFocalPoint(layer, focalPoint, focalX, focalY, gainX, gainY, foveaArea);
+}
+
+void Context::endTiling(GLbitfield preserveMask)
+{
+    ANGLE_CONTEXT_TRY(mImplementation->endTiling(this, preserveMask));
+    getMutablePrivateState()->setTiledRendering(false);
+}
+
+void Context::startTiling(GLuint x, GLuint y, GLuint width, GLuint height, GLbitfield preserveMask)
+{
+    ANGLE_CONTEXT_TRY(syncDirtyObjects(kTilingDirtyObjects, Command::Other));
+    ANGLE_CONTEXT_TRY(syncDirtyBits(kTilingDirtyBits, kTilingExtendedDirtyBits, Command::Other));
+    ANGLE_CONTEXT_TRY(
+        mImplementation->startTiling(this, Rectangle(x, y, width, height), preserveMask));
+    getMutablePrivateState()->setTiledRendering(true);
+}
+
+void Context::clearTexImage(TextureID texturePacked,
+                            GLint level,
+                            GLenum format,
+                            GLenum type,
+                            const void *data)
+{
+    Texture *texture = getTexture(texturePacked);
+
+    // Sync the texture's state directly. EXT_clear_texture does not require that the texture is
+    // bound.
+    if (texture->hasAnyDirtyBit())
+    {
+        ANGLE_CONTEXT_TRY(texture->syncState(this, Command::ClearTexture));
+    }
+
+    ANGLE_CONTEXT_TRY(
+        texture->clearImage(this, level, format, type, static_cast<const uint8_t *>(data)));
+}
+
+void Context::clearTexSubImage(TextureID texturePacked,
+                               GLint level,
+                               GLint xoffset,
+                               GLint yoffset,
+                               GLint zoffset,
+                               GLsizei width,
+                               GLsizei height,
+                               GLsizei depth,
+                               GLenum format,
+                               GLenum type,
+                               const void *data)
+{
+    Texture *texture = getTexture(texturePacked);
+
+    // It is allowed to use extents of 0 as input args. In this case, the function should return
+    // with no changes to the texture.
+    if (width == 0 || height == 0 || depth == 0)
+    {
+        return;
+    }
+
+    // Sync the texture's state directly. EXT_clear_texture does not require that the texture is
+    // bound.
+    if (texture->hasAnyDirtyBit())
+    {
+        ANGLE_CONTEXT_TRY(texture->syncState(this, Command::ClearTexture));
+    }
+
+    Box area(xoffset, yoffset, zoffset, width, height, depth);
+    ANGLE_CONTEXT_TRY(texture->clearSubImage(this, level, area, format, type,
+                                             static_cast<const uint8_t *>(data)));
 }
 
 // ErrorSet implementation.
@@ -10091,6 +10185,19 @@ GLenum ErrorSet::getGraphicsResetStatus(rx::ContextImpl *contextImpl)
     }
 
     return ToGLenum(mResetStatus);
+}
+
+GLenum ErrorSet::getErrorForCapture() const
+{
+    if (mErrors.empty())
+    {
+        return GL_NO_ERROR;
+    }
+    else
+    {
+        // Return the error without clearing it
+        return *mErrors.begin();
+    }
 }
 
 // StateCache implementation.
@@ -10400,7 +10507,8 @@ void StateCache::updateValidDrawModes(Context *context)
         // active and not paused, regardless of mode. Any primitive type may be used while transform
         // feedback is paused.
         if (!context->getExtensions().geometryShaderAny() &&
-            !context->getExtensions().tessellationShaderEXT && context->getClientVersion() < ES_3_2)
+            !context->getExtensions().tessellationShaderAny() &&
+            context->getClientVersion() < ES_3_2)
         {
             mCachedValidDrawModes.fill(false);
             mCachedValidDrawModes[curTransformFeedback->getPrimitiveMode()] = true;

@@ -65,9 +65,6 @@ class CompressedTextureFormatsTest : public ANGLETest<CompressedTextureTestParam
 
     void testSetUp() override
     {
-        // Older Metal versions do not support compressed TEXTURE_3D.
-        mDisableTexture3D = IsMetal() && !IsMetalCompressedTexture3DAvailable();
-
         // Apple platforms require PVRTC1 textures to be squares.
         mSquarePvrtc1 = IsAppleGPU();
     }
@@ -219,7 +216,7 @@ class CompressedTextureFormatsTest : public ANGLETest<CompressedTextureTestParam
 
         // Try a whole image update from a pixel unpack buffer.
         // Don't test non-emulated formats on Desktop GL.
-        // TODO(anglebug.com/6300): implement emulation on Desktop GL, then remove this check.
+        // TODO(anglebug.com/42264819): implement emulation on Desktop GL, then remove this check.
         if (!(IsDesktopOpenGL() && desc.mayBeEmulated()))
         {
             GLBuffer buffer;

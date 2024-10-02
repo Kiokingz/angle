@@ -22,14 +22,14 @@ CLDeviceVk::CLDeviceVk(const cl::Device &device, vk::Renderer *renderer)
 
     // Setup initial device mInfo fields
     // TODO(aannestrand) Create cl::Caps and use for device creation
-    // http://anglebug.com/8529
+    // http://anglebug.com/42266954
     mInfoString = {
         {cl::DeviceInfo::Name, std::string(props.deviceName)},
         {cl::DeviceInfo::Vendor, mRenderer->getVendorString()},
         {cl::DeviceInfo::DriverVersion, mRenderer->getVersionString(true)},
         {cl::DeviceInfo::Version, std::string("OpenCL 3.0 " + mRenderer->getVersionString(true))},
         {cl::DeviceInfo::Profile, std::string("FULL_PROFILE")},
-        {cl::DeviceInfo::OpenCL_C_Version, std::string("OpenCL C 3.0 ")},
+        {cl::DeviceInfo::OpenCL_C_Version, std::string("OpenCL C 1.2 ")},
         {cl::DeviceInfo::LatestConformanceVersionPassed, std::string("FIXME")}};
     mInfoSizeT = {
         {cl::DeviceInfo::MaxWorkGroupSize, props.limits.maxComputeWorkGroupInvocations},
@@ -37,7 +37,7 @@ CLDeviceVk::CLDeviceVk(const cl::Device &device, vk::Renderer *renderer)
         {cl::DeviceInfo::GlobalVariablePreferredTotalSize, 0},
 
         // TODO(aannestrand) Update these hardcoded platform/device queries
-        // http://anglebug.com/8511
+        // http://anglebug.com/42266935
         {cl::DeviceInfo::MaxParameterSize, 1024},
         {cl::DeviceInfo::ProfilingTimerResolution, 1},
         {cl::DeviceInfo::PrintfBufferSize, 1024 * 1024},
@@ -52,7 +52,7 @@ CLDeviceVk::CLDeviceVk(const cl::Device &device, vk::Renderer *renderer)
         {cl::DeviceInfo::QueueOnHostProperties, CL_QUEUE_PROFILING_ENABLE},
 
         // TODO(aannestrand) Update these hardcoded platform/device queries
-        // http://anglebug.com/8511
+        // http://anglebug.com/42266935
         {cl::DeviceInfo::HalfFpConfig, 0},
         {cl::DeviceInfo::DoubleFpConfig, 0},
         {cl::DeviceInfo::GlobalMemCacheSize, 0},
@@ -88,8 +88,8 @@ CLDeviceVk::CLDeviceVk(const cl::Device &device, vk::Renderer *renderer)
         {cl::DeviceInfo::ExecutionCapabilities, CL_EXEC_KERNEL},
 
         // TODO(aannestrand) Update these hardcoded platform/device queries
-        // http://anglebug.com/8511
-        {cl::DeviceInfo::AddressBits, 64},
+        // http://anglebug.com/42266935
+        {cl::DeviceInfo::AddressBits, 32},
         {cl::DeviceInfo::EndianLittle, CL_TRUE},
         {cl::DeviceInfo::LocalMemType, CL_LOCAL},
         {cl::DeviceInfo::MaxSamplers, 0},
@@ -119,7 +119,7 @@ CLDeviceVk::CLDeviceVk(const cl::Device &device, vk::Renderer *renderer)
         {cl::DeviceInfo::PreferredLocalAtomicAlignment, 0},
         {cl::DeviceInfo::PreferredGlobalAtomicAlignment, 0},
         {cl::DeviceInfo::PreferredPlatformAtomicAlignment, 0},
-        {cl::DeviceInfo::NonUniformWorkGroupSupport, CL_TRUE},
+        {cl::DeviceInfo::NonUniformWorkGroupSupport, CL_FALSE},
         {cl::DeviceInfo::GenericAddressSpaceSupport, CL_FALSE},
         {cl::DeviceInfo::SubGroupIndependentForwardProgress, CL_FALSE},
         {cl::DeviceInfo::WorkGroupCollectiveFunctionsSupport, CL_FALSE},
@@ -139,12 +139,12 @@ CLDeviceImpl::Info CLDeviceVk::createInfo(cl::DeviceType type) const
     info.maxWorkItemSizes.push_back(properties.limits.maxComputeWorkGroupSize[2]);
 
     // TODO(aannestrand) Update these hardcoded platform/device queries
-    // http://anglebug.com/8511
+    // http://anglebug.com/42266935
     info.maxMemAllocSize  = 1 << 30;
     info.memBaseAddrAlign = 1024;
 
     // TODO(aannestrand) Add image and sampler support later
-    // http://anglebug.com/8512
+    // http://anglebug.com/42266936
     info.imageSupport = CL_FALSE;
 
     info.image2D_MaxWidth          = properties.limits.maxImageDimension2D;
@@ -162,11 +162,10 @@ CLDeviceImpl::Info CLDeviceVk::createInfo(cl::DeviceType type) const
     info.builtInKernels       = "";
     info.version              = CL_MAKE_VERSION(3, 0, 0);
     info.versionStr           = "OpenCL 3.0 " + mRenderer->getVersionString(true);
-    info.OpenCL_C_AllVersions = {{CL_MAKE_VERSION(3, 0, 0), "OpenCL C"},
-                                 {CL_MAKE_VERSION(2, 0, 0), "OpenCL C"},
-                                 {CL_MAKE_VERSION(1, 2, 0), "OpenCL C"},
+    info.OpenCL_C_AllVersions = {{CL_MAKE_VERSION(1, 0, 0), "OpenCL C"},
                                  {CL_MAKE_VERSION(1, 1, 0), "OpenCL C"},
-                                 {CL_MAKE_VERSION(1, 0, 0), "OpenCL C"}};
+                                 {CL_MAKE_VERSION(1, 2, 0), "OpenCL C"},
+                                 {CL_MAKE_VERSION(3, 0, 0), "OpenCL C"}};
 
     info.OpenCL_C_Features         = {};
     info.extensionsWithVersion     = {};
@@ -264,7 +263,7 @@ cl::WorkgroupSize CLDeviceVk::selectWorkGroupSize(const cl::NDRange &ndrange) co
             newLocalSize[i] *= 2;
 
             // TODO: Add support for non-uniform WGS
-            // http://anglebug.com/8631
+            // http://anglebug.com/42267067
             if (ndrange.globalWorkSize[i] % newLocalSize[i] == 0 &&
                 newLocalSize[i] <= props.limits.maxComputeWorkGroupCount[i] &&
                 newLocalSize[0] * newLocalSize[1] * newLocalSize[2] <= maxSize)

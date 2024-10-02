@@ -21,6 +21,12 @@ namespace gl
 {
 namespace
 {
+bool IsStencilWriteMaskedOut(GLuint stencilWritemask, GLuint framebufferStencilSize)
+{
+    const GLuint framebufferMask = angle::BitMask<GLuint>(framebufferStencilSize);
+    return (stencilWritemask & framebufferMask) == 0;
+}
+
 bool IsStencilNoOp(GLenum stencilFunc,
                    GLenum stencilFail,
                    GLenum stencilPassDepthFail,
@@ -165,21 +171,20 @@ bool DepthStencilState::isDepthMaskedOut() const
     return !depthMask;
 }
 
-bool DepthStencilState::isStencilMaskedOut() const
+bool DepthStencilState::isStencilMaskedOut(GLuint framebufferStencilSize) const
 {
-    return (stencilMask & stencilWritemask) == 0;
+    return IsStencilWriteMaskedOut(stencilWritemask, framebufferStencilSize);
 }
 
-bool DepthStencilState::isStencilNoOp() const
+bool DepthStencilState::isStencilNoOp(GLuint framebufferStencilSize) const
 {
-    return isStencilMaskedOut() ||
+    return isStencilMaskedOut(framebufferStencilSize) ||
            IsStencilNoOp(stencilFunc, stencilFail, stencilPassDepthFail, stencilPassDepthPass);
 }
 
-bool DepthStencilState::isStencilBackNoOp() const
+bool DepthStencilState::isStencilBackNoOp(GLuint framebufferStencilSize) const
 {
-    const bool isStencilBackMaskedOut = (stencilBackMask & stencilBackWritemask) == 0;
-    return isStencilBackMaskedOut ||
+    return IsStencilWriteMaskedOut(stencilBackWritemask, framebufferStencilSize) ||
            IsStencilNoOp(stencilBackFunc, stencilBackFail, stencilBackPassDepthFail,
                          stencilBackPassDepthPass);
 }
@@ -1074,6 +1079,7 @@ bool CompressBlob(const size_t cacheSize, const uint8_t *cacheData, MemoryBuffer
 {
     uLong uncompressedSize       = static_cast<uLong>(cacheSize);
     uLong expectedCompressedSize = zlib_internal::GzipExpectedCompressedSize(uncompressedSize);
+    uLong actualCompressedSize   = expectedCompressedSize;
 
     // Allocate memory.
     if (!compressedData->resize(expectedCompressedSize))
@@ -1082,7 +1088,7 @@ bool CompressBlob(const size_t cacheSize, const uint8_t *cacheData, MemoryBuffer
         return false;
     }
 
-    int zResult = zlib_internal::GzipCompressHelper(compressedData->data(), &expectedCompressedSize,
+    int zResult = zlib_internal::GzipCompressHelper(compressedData->data(), &actualCompressedSize,
                                                     cacheData, uncompressedSize, nullptr, nullptr);
 
     if (zResult != Z_OK)
@@ -1091,11 +1097,9 @@ bool CompressBlob(const size_t cacheSize, const uint8_t *cacheData, MemoryBuffer
         return false;
     }
 
-    // Resize it to expected size.
-    if (!compressedData->resize(expectedCompressedSize))
-    {
-        return false;
-    }
+    // Trim to actual size.
+    ASSERT(actualCompressedSize <= expectedCompressedSize);
+    compressedData->setSize(actualCompressedSize);
 
     return true;
 }
@@ -1108,6 +1112,13 @@ bool DecompressBlob(const uint8_t *compressedData,
     // Call zlib function to decompress.
     uint32_t uncompressedSize =
         zlib_internal::GetGzipUncompressedSize(compressedData, compressedSize);
+
+    if (uncompressedSize == 0)
+    {
+        ERR() << "Decompressed data size is zero. Wrong or corrupted data? (compressed size is: "
+              << compressedSize << ")";
+        return false;
+    }
 
     if (uncompressedSize > maxUncompressedDataSize)
     {
@@ -1133,13 +1144,27 @@ bool DecompressBlob(const uint8_t *compressedData,
         return false;
     }
 
-    // Resize it to expected size.
-    if (!uncompressedData->resize(destLen))
-    {
-        return false;
-    }
+    // Trim to actual size.
+    ASSERT(destLen <= uncompressedSize);
+    uncompressedData->setSize(destLen);
 
     return true;
+}
+
+uint32_t GenerateCRC32(const uint8_t *data, size_t size)
+{
+    return UpdateCRC32(InitCRC32(), data, size);
+}
+
+uint32_t InitCRC32()
+{
+    // To get required initial value for the crc, need to pass nullptr into buf.
+    return static_cast<uint32_t>(crc32_z(0u, nullptr, 0u));
+}
+
+uint32_t UpdateCRC32(uint32_t prevCrc32, const uint8_t *data, size_t size)
+{
+    return static_cast<uint32_t>(crc32_z(static_cast<uLong>(prevCrc32), data, size));
 }
 
 UnlockedTailCall::UnlockedTailCall() = default;
