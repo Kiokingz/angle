@@ -44,6 +44,7 @@ enum class Command
     Blit,
     BlitAll = Blit + 0x7,
     Clear,
+    ClearTexture,
     CopyImage,
     Dispatch,
     Draw,
@@ -300,9 +301,9 @@ struct DepthStencilState final
     DepthStencilState &operator=(const DepthStencilState &other);
 
     bool isDepthMaskedOut() const;
-    bool isStencilMaskedOut() const;
-    bool isStencilNoOp() const;
-    bool isStencilBackNoOp() const;
+    bool isStencilMaskedOut(GLuint framebufferStencilSize) const;
+    bool isStencilNoOp(GLuint framebufferStencilSize) const;
+    bool isStencilBackNoOp(GLuint framebufferStencilSize) const;
 
     bool depthTest;
     GLenum depthFunc;
@@ -1279,6 +1280,9 @@ bool DecompressBlob(const uint8_t *compressedData,
                     const size_t compressedSize,
                     size_t maxUncompressedDataSize,
                     MemoryBuffer *uncompressedData);
+uint32_t GenerateCRC32(const uint8_t *data, size_t size);
+uint32_t InitCRC32();
+uint32_t UpdateCRC32(uint32_t prevCrc32, const uint8_t *data, size_t size);
 }  // namespace angle
 
 namespace std
@@ -1450,9 +1454,11 @@ struct FocalPoint
                gainY == other.gainY && foveaArea == other.foveaArea;
     }
     bool operator!=(const FocalPoint &other) const { return !(*this == other); }
+
+    bool valid() const { return gainX > 0 && gainY > 0; }
 };
 
-constexpr FocalPoint kInvalidFocalPoint = FocalPoint();
+constexpr FocalPoint kDefaultFocalPoint = FocalPoint();
 
 class FoveationState
 {
@@ -1462,7 +1468,7 @@ class FoveationState
         mConfigured          = false;
         mFoveatedFeatureBits = 0;
         mMinPixelDensity     = 0.0f;
-        mFocalPoints.fill(kInvalidFocalPoint);
+        mFocalPoints.fill(kDefaultFocalPoint);
     }
     FoveationState &operator=(const FoveationState &other) = default;
 
@@ -1470,10 +1476,9 @@ class FoveationState
     bool isConfigured() const { return mConfigured; }
     bool isFoveated() const
     {
-        // Consider foveated if ANY focal point is valid
-        return std::any_of(
-            mFocalPoints.begin(), mFocalPoints.end(),
-            [](const FocalPoint &focalPoint) { return (focalPoint != kInvalidFocalPoint); });
+        // Consider foveated if at least 1 focal point is valid
+        return std::any_of(mFocalPoints.begin(), mFocalPoints.end(),
+                           [](const FocalPoint &focalPoint) { return focalPoint.valid(); });
     }
     bool operator==(const FoveationState &other) const
     {

@@ -10,6 +10,7 @@
 
 #include "libANGLE/renderer/vulkan/cl_types.h"
 #include "libANGLE/renderer/vulkan/vk_cache_utils.h"
+#include "libANGLE/renderer/vulkan/vk_helpers.h"
 #include "libANGLE/renderer/vulkan/vk_utils.h"
 
 #include "libANGLE/renderer/CLKernelImpl.h"
@@ -66,6 +67,16 @@ class CLKernelVk : public CLKernelImpl
 {
   public:
     using Ptr = std::unique_ptr<CLKernelVk>;
+
+    struct KernelSpecConstant
+    {
+        uint32_t ID;
+        uint32_t data;
+    };
+    // Setting a reasonable initial value
+    // https://registry.khronos.org/OpenCL/specs/3.0-unified/html/OpenCL_API.html#CL_DEVICE_MAX_PARAMETER_SIZE
+    using KernelSpecConstants = angle::FastVector<KernelSpecConstant, 128>;
+
     CLKernelVk(const cl::Kernel &kernel,
                std::string &name,
                std::string &attributes,
@@ -76,20 +87,30 @@ class CLKernelVk : public CLKernelImpl
 
     angle::Result createInfo(CLKernelImpl::Info *infoOut) const override;
 
-    const CLProgramVk *getProgram() { return mProgram; }
+    CLProgramVk *getProgram() { return mProgram; }
     const std::string &getKernelName() { return mName; }
     const CLKernelArguments &getArgs() { return mArgs; }
-    VkDescriptorSet &getDescriptorSet() { return mDescriptorSet; }
     vk::AtomicBindingPointer<vk::PipelineLayout> &getPipelineLayout() { return mPipelineLayout; }
     vk::DescriptorSetLayoutPointerArray &getDescriptorSetLayouts() { return mDescriptorSetLayouts; }
+    cl::Kernel &getFrontendObject() { return const_cast<cl::Kernel &>(mKernel); }
+
+    angle::Result getOrCreateComputePipeline(vk::PipelineCacheAccess *pipelineCache,
+                                             const cl::NDRange &ndrange,
+                                             const cl::Device &device,
+                                             vk::PipelineHelper **pipelineOut,
+                                             cl::WorkgroupCount *workgroupCountOut);
 
   private:
+    static constexpr std::array<size_t, 3> kEmptyWorkgroupSize = {0, 0, 0};
+
     CLProgramVk *mProgram;
     CLContextVk *mContext;
     std::string mName;
     std::string mAttributes;
     CLKernelArguments mArgs;
-    VkDescriptorSet mDescriptorSet{VK_NULL_HANDLE};
+    vk::ShaderProgramHelper mShaderProgramHelper;
+    vk::ComputePipelineCache mComputePipelineCache;
+    KernelSpecConstants mSpecConstants;
     vk::AtomicBindingPointer<vk::PipelineLayout> mPipelineLayout;
     vk::DescriptorSetLayoutPointerArray mDescriptorSetLayouts{};
 };

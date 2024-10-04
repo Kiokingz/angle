@@ -15,6 +15,7 @@
 
 #include "libANGLE/CLBuffer.h"
 #include "libANGLE/CLContext.h"
+#include "libANGLE/CLEvent.h"
 #include "libANGLE/CLProgram.h"
 #include "libANGLE/cl_utils.h"
 
@@ -25,7 +26,9 @@ CLContextVk::CLContextVk(const cl::Context &context, const cl::DevicePtrs device
     : CLContextImpl(context),
       vk::Context(getPlatform()->getRenderer()),
       mAssociatedDevices(devicePtrs)
-{}
+{
+    mDeviceQueueIndex = mRenderer->getDefaultDeviceQueueIndex();
+}
 
 CLContextVk::~CLContextVk() = default;
 
@@ -99,9 +102,6 @@ angle::Result CLContextVk::createBuffer(const cl::Buffer &buffer,
 }
 
 angle::Result CLContextVk::createImage(const cl::Image &image,
-                                       cl::MemFlags flags,
-                                       const cl_image_format &format,
-                                       const cl::ImageDescriptor &desc,
                                        void *hostPtr,
                                        CLMemoryImpl::Ptr *imageOut)
 {
@@ -188,6 +188,7 @@ angle::Result CLContextVk::linkProgram(const cl::Program &program,
     {
         ANGLE_CL_RETURN_ERROR(CL_OUT_OF_HOST_MEMORY);
     }
+    ANGLE_TRY(programImpl->init());
 
     cl::DevicePtrs linkDeviceList;
     CLProgramVk::LinkProgramsList linkProgramsList;
@@ -215,6 +216,8 @@ angle::Result CLContextVk::linkProgram(const cl::Program &program,
             linkProgramsList.push_back(linkPrograms);
         }
     }
+
+    programImpl->setBuildStatus(linkDeviceList, CL_BUILD_IN_PROGRESS);
 
     // Perform link
     if (notify)
@@ -251,8 +254,23 @@ angle::Result CLContextVk::createUserEvent(const cl::Event &event, CLEventImpl::
 
 angle::Result CLContextVk::waitForEvents(const cl::EventPtrs &events)
 {
-    UNIMPLEMENTED();
-    ANGLE_CL_RETURN_ERROR(CL_OUT_OF_RESOURCES);
+    for (auto &event : events)
+    {
+        CLEventVk *eventVk = &event.get()->getImpl<CLEventVk>();
+        if (eventVk->isUserEvent())
+        {
+            ANGLE_TRY(eventVk->waitForUserEventStatus());
+        }
+        else
+        {
+            // TODO rework this to instead (flush w/ ResourceUse serial wait) once we move away from
+            // spawning a submit-thread/Task for flush routine
+            // https://anglebug.com/42267107
+            ANGLE_TRY(event->getCommandQueue()->finish());
+        }
+    }
+
+    return angle::Result::Continue;
 }
 
 }  // namespace rx

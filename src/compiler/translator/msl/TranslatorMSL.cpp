@@ -25,9 +25,9 @@
 #include "compiler/translator/tree_ops/RemoveInactiveInterfaceVariables.h"
 #include "compiler/translator/tree_ops/RewriteArrayOfArrayOfOpaqueUniforms.h"
 #include "compiler/translator/tree_ops/RewriteAtomicCounters.h"
-#include "compiler/translator/tree_ops/RewriteCubeMapSamplersAs2DArray.h"
 #include "compiler/translator/tree_ops/RewriteDfdy.h"
 #include "compiler/translator/tree_ops/RewriteStructSamplers.h"
+#include "compiler/translator/tree_ops/SeparateCompoundStructDeclarations.h"
 #include "compiler/translator/tree_ops/SeparateStructFromUniformDeclarations.h"
 #include "compiler/translator/tree_ops/msl/AddExplicitTypeCasts.h"
 #include "compiler/translator/tree_ops/msl/ConvertUnsupportedConstructorsToFunctionCalls.h"
@@ -41,7 +41,6 @@
 #include "compiler/translator/tree_ops/msl/RewriteOutArgs.h"
 #include "compiler/translator/tree_ops/msl/RewriteUnaddressableReferences.h"
 #include "compiler/translator/tree_ops/msl/SeparateCompoundExpressions.h"
-#include "compiler/translator/tree_ops/msl/SeparateCompoundStructDeclarations.h"
 #include "compiler/translator/tree_ops/msl/WrapMain.h"
 #include "compiler/translator/tree_util/BuiltIn.h"
 #include "compiler/translator/tree_util/DriverUniform.h"
@@ -520,7 +519,7 @@ void AddFragDepthEXTDeclaration(TCompiler &compiler, TIntermBlock &root, TSymbol
         // EXT_blend_func_extended usage, the exact variable may be unknown until the
         // program is linked.
         TVariable *alpha0 =
-            new TVariable(&symbolTable, sh::ImmutableString("_ALPHA0"),
+            new TVariable(&symbolTable, sh::ImmutableString("ALPHA0"),
                           StaticType::Get<EbtFloat, EbpUndefined, EvqSpecConst, 1, 1>(),
                           SymbolType::AngleInternal);
 
@@ -1006,9 +1005,8 @@ bool TranslatorMSL::translateImpl(TInfoSinkBase &sink,
     UnsupportedFunctionArgsBitSet args{UnsupportedFunctionArgs::StructContainingSamplers,
                                        UnsupportedFunctionArgs::ArrayOfArrayOfSamplerOrImage,
                                        UnsupportedFunctionArgs::AtomicCounter,
-                                       UnsupportedFunctionArgs::SamplerCubeEmulation,
                                        UnsupportedFunctionArgs::Image};
-    if (!MonomorphizeUnsupportedFunctions(this, root, &getSymbolTable(), compileOptions, args))
+    if (!MonomorphizeUnsupportedFunctions(this, root, &getSymbolTable(), args))
     {
         return false;
     }
@@ -1039,15 +1037,6 @@ bool TranslatorMSL::translateImpl(TInfoSinkBase &sink,
     if (!RewriteArrayOfArrayOfOpaqueUniforms(this, root, &getSymbolTable()))
     {
         return false;
-    }
-
-    if (compileOptions.emulateSeamfulCubeMapSampling)
-    {
-        if (!RewriteCubeMapSamplersAs2DArray(this, root, &symbolTable,
-                                             getShaderType() == GL_FRAGMENT_SHADER))
-        {
-            return false;
-        }
     }
 
     if (getShaderVersion() >= 300 ||
@@ -1443,7 +1432,8 @@ bool TranslatorMSL::translateImpl(TInfoSinkBase &sink,
         return false;
     }
 
-    if (!SeparateCompoundStructDeclarations(*this, idGen, *root))
+    if (!SeparateCompoundStructDeclarations(
+            *this, [&idGen]() { return idGen.createNewName().rawName(); }, *root))
     {
         return false;
     }
@@ -1524,7 +1514,7 @@ bool TranslatorMSL::translate(TIntermBlock *root,
     }
 
     // TODO: refactor the code in TranslatorMSL to not issue raw function calls.
-    // http://anglebug.com/6059#c2
+    // http://anglebug.com/42264589#comment3
     mValidateASTOptions.validateNoRawFunctionCalls = false;
     // A validation error is generated in this backend due to bool uniforms.
     mValidateASTOptions.validatePrecision = false;

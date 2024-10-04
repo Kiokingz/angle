@@ -19,33 +19,41 @@ RenderTargetWgpu::~RenderTargetWgpu()
 }
 
 RenderTargetWgpu::RenderTargetWgpu(RenderTargetWgpu &&other)
-    : mTexture(std::move(other.mTexture)),
+    : mImage(other.mImage),
+      mTextureView(std::move(other.mTextureView)),
       mLevelIndex(other.mLevelIndex),
       mLayerIndex(other.mLayerIndex),
       mFormat(other.mFormat)
 {}
 
-void RenderTargetWgpu::set(const wgpu::TextureView &texture,
+void RenderTargetWgpu::set(webgpu::ImageHelper *image,
+                           const wgpu::TextureView &texture,
                            const webgpu::LevelIndex level,
                            uint32_t layer,
                            const wgpu::TextureFormat &format)
 {
-    mTexture    = texture;
-    mLevelIndex = level;
-    mLayerIndex = layer;
-    mFormat     = &format;
-}
-
-void RenderTargetWgpu::setTexture(const wgpu::TextureView &texture)
-{
-    mTexture = texture;
+    mImage       = image;
+    mTextureView = texture;
+    mLevelIndex  = level;
+    mLayerIndex  = layer;
+    mFormat      = &format;
 }
 
 void RenderTargetWgpu::reset()
 {
-    mTexture    = nullptr;
-    mLevelIndex = webgpu::LevelIndex(0);
-    mLayerIndex = 0;
-    mFormat     = nullptr;
+    mTextureView = nullptr;
+    mLevelIndex  = webgpu::LevelIndex(0);
+    mLayerIndex  = 0;
+    mFormat      = nullptr;
+}
+
+angle::Result RenderTargetWgpu::flushImageStagedUpdates(ContextWgpu *contextWgpu,
+                                                        webgpu::ClearValuesArray *deferredClears,
+                                                        uint32_t deferredClearIndex)
+{
+    gl::LevelIndex targetLevel = mImage->toGlLevel(mLevelIndex);
+    ANGLE_TRY(mImage->flushSingleLevelUpdates(contextWgpu, targetLevel, deferredClears,
+                                              deferredClearIndex));
+    return angle::Result::Continue;
 }
 }  // namespace rx

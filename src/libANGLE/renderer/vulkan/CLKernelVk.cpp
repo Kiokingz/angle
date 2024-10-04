@@ -28,7 +28,10 @@ CLKernelVk::CLKernelVk(const cl::Kernel &kernel,
       mName(name),
       mAttributes(attributes),
       mArgs(args)
-{}
+{
+    mShaderProgramHelper.setShader(gl::ShaderType::Compute,
+                                   mKernel.getProgram().getImpl<CLProgramVk>().getShaderModule());
+}
 
 CLKernelVk::~CLKernelVk()
 {
@@ -36,6 +39,13 @@ CLKernelVk::~CLKernelVk()
     {
         dsLayouts.reset();
     }
+
+    mPipelineLayout.reset();
+    for (auto &pipelineHelper : mComputePipelineCache)
+    {
+        pipelineHelper.destroy(mContext->getDevice());
+    }
+    mShaderProgramHelper.destroy(mContext->getRenderer());
 }
 
 angle::Result CLKernelVk::setArg(cl_uint argIndex, size_t argSize, const void *argValue)
@@ -45,6 +55,13 @@ angle::Result CLKernelVk::setArg(cl_uint argIndex, size_t argSize, const void *a
     {
         arg.handle     = const_cast<void *>(argValue);
         arg.handleSize = argSize;
+
+        if (arg.type == NonSemanticClspvReflectionArgumentWorkgroup)
+        {
+            mSpecConstants.push_back(
+                KernelSpecConstant{.ID   = arg.workgroupSpecId,
+                                   .data = static_cast<uint32_t>(argSize / arg.workgroupSize)});
+        }
     }
 
     return angle::Result::Continue;
@@ -79,22 +96,22 @@ angle::Result CLKernelVk::createInfo(CLKernelImpl::Info *info) const
             continue;
         }
 
-        // TODO: http://anglebug.com/8576
+        // TODO: http://anglebug.com/42267005
         ANGLE_TRY(
             deviceVk->getInfoSizeT(cl::DeviceInfo::MaxWorkGroupSize, &workGroup.workGroupSize));
 
-        // TODO: http://anglebug.com/8575
+        // TODO: http://anglebug.com/42267004
         workGroup.privateMemSize = 0;
         workGroup.localMemSize   = 0;
 
         workGroup.prefWorkGroupSizeMultiple = 16u;
         workGroup.globalWorkSize            = {0, 0, 0};
-        if (deviceProgramData->reflectionData.kernelCompileWGS.contains(mName))
+        if (deviceProgramData->reflectionData.kernelCompileWorkgroupSize.contains(mName))
         {
             workGroup.compileWorkGroupSize = {
-                deviceProgramData->reflectionData.kernelCompileWGS.at(mName)[0],
-                deviceProgramData->reflectionData.kernelCompileWGS.at(mName)[1],
-                deviceProgramData->reflectionData.kernelCompileWGS.at(mName)[2]};
+                deviceProgramData->reflectionData.kernelCompileWorkgroupSize.at(mName)[0],
+                deviceProgramData->reflectionData.kernelCompileWorkgroupSize.at(mName)[1],
+                deviceProgramData->reflectionData.kernelCompileWorkgroupSize.at(mName)[2]};
         }
         else
         {
@@ -103,6 +120,105 @@ angle::Result CLKernelVk::createInfo(CLKernelImpl::Info *info) const
     }
 
     return angle::Result::Continue;
+}
+
+angle::Result CLKernelVk::getOrCreateComputePipeline(vk::PipelineCacheAccess *pipelineCache,
+                                                     const cl::NDRange &ndrange,
+                                                     const cl::Device &device,
+                                                     vk::PipelineHelper **pipelineOut,
+                                                     cl::WorkgroupCount *workgroupCountOut)
+{
+    const CLProgramVk::DeviceProgramData *devProgramData =
+        getProgram()->getDeviceProgramData(device.getNative());
+    ASSERT(devProgramData != nullptr);
+
+    // Start with Workgroup size (WGS) from kernel attribute (if available)
+    cl::WorkgroupSize workgroupSize = devProgramData->getCompiledWorkgroupSize(getKernelName());
+
+    if (workgroupSize == kEmptyWorkgroupSize)
+    {
+        if (ndrange.nullLocalWorkSize)
+        {
+            // NULL value was passed, in which case the OpenCL implementation will determine
+            // how to be break the global work-items into appropriate work-group instances.
+            workgroupSize = device.getImpl<CLDeviceVk>().selectWorkGroupSize(ndrange);
+        }
+        else
+        {
+            // Local work size (LWS) was valid, use that as WGS
+            workgroupSize = ndrange.localWorkSize;
+        }
+    }
+
+    // Calculate the workgroup count
+    // TODO: Add support for non-uniform WGS
+    // http://angleproject:8631
+    ASSERT(workgroupSize[0] != 0);
+    ASSERT(workgroupSize[1] != 0);
+    ASSERT(workgroupSize[2] != 0);
+    (*workgroupCountOut)[0] = static_cast<uint32_t>((ndrange.globalWorkSize[0] / workgroupSize[0]));
+    (*workgroupCountOut)[1] = static_cast<uint32_t>((ndrange.globalWorkSize[1] / workgroupSize[1]));
+    (*workgroupCountOut)[2] = static_cast<uint32_t>((ndrange.globalWorkSize[2] / workgroupSize[2]));
+
+    // Populate program specialization constants (if any)
+    uint32_t constantDataOffset = 0;
+    std::vector<uint32_t> specConstantData;
+    std::vector<VkSpecializationMapEntry> mapEntries;
+    for (const auto specConstantUsed : devProgramData->reflectionData.specConstantsUsed)
+    {
+        switch (specConstantUsed)
+        {
+            case SpecConstantType::WorkDimension:
+                specConstantData.push_back(ndrange.workDimensions);
+                break;
+            case SpecConstantType::WorkgroupSizeX:
+                specConstantData.push_back(static_cast<uint32_t>(workgroupSize[0]));
+                break;
+            case SpecConstantType::WorkgroupSizeY:
+                specConstantData.push_back(static_cast<uint32_t>(workgroupSize[1]));
+                break;
+            case SpecConstantType::WorkgroupSizeZ:
+                specConstantData.push_back(static_cast<uint32_t>(workgroupSize[2]));
+                break;
+            case SpecConstantType::GlobalOffsetX:
+                specConstantData.push_back(static_cast<uint32_t>(ndrange.globalWorkOffset[0]));
+                break;
+            case SpecConstantType::GlobalOffsetY:
+                specConstantData.push_back(static_cast<uint32_t>(ndrange.globalWorkOffset[1]));
+                break;
+            case SpecConstantType::GlobalOffsetZ:
+                specConstantData.push_back(static_cast<uint32_t>(ndrange.globalWorkOffset[2]));
+                break;
+            default:
+                UNIMPLEMENTED();
+                continue;
+        }
+        mapEntries.push_back(VkSpecializationMapEntry{
+            .constantID = devProgramData->reflectionData.specConstantIDs[specConstantUsed],
+            .offset     = constantDataOffset,
+            .size       = sizeof(uint32_t)});
+        constantDataOffset += sizeof(uint32_t);
+    }
+    // Populate kernel specialization constants (if any)
+    for (const auto &specConstant : mSpecConstants)
+    {
+        specConstantData.push_back(specConstant.data);
+        mapEntries.push_back(VkSpecializationMapEntry{
+            .constantID = specConstant.ID, .offset = constantDataOffset, .size = sizeof(uint32_t)});
+        constantDataOffset += sizeof(uint32_t);
+    }
+    VkSpecializationInfo computeSpecializationInfo{
+        .mapEntryCount = static_cast<uint32_t>(mapEntries.size()),
+        .pMapEntries   = mapEntries.data(),
+        .dataSize      = specConstantData.size() * sizeof(uint32_t),
+        .pData         = specConstantData.data(),
+    };
+
+    // Now get or create (on compute pipeline cache miss) compute pipeline and return it
+    return mShaderProgramHelper.getOrCreateComputePipeline(
+        mContext, &mComputePipelineCache, pipelineCache, getPipelineLayout().get(),
+        vk::ComputePipelineOptions{}, PipelineSource::Draw, pipelineOut, mName.c_str(),
+        &computeSpecializationInfo);
 }
 
 }  // namespace rx

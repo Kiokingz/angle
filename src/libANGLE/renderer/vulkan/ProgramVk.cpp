@@ -119,9 +119,16 @@ class LinkTaskVk final : public vk::Context, public LinkTask
             ANGLE_TRY(contextVk->switchToFramebufferFetchMode(true));
         }
 
-        // Update the relevant perf counters
-        angle::VulkanPerfCounters &from = contextVk->getPerfCounters();
-        angle::VulkanPerfCounters &to   = getPerfCounters();
+        // Forward any errors
+        if (mErrorCode != VK_SUCCESS)
+        {
+            contextVk->handleError(mErrorCode, mErrorFile, mErrorFunction, mErrorLine);
+            return angle::Result::Stop;
+        }
+
+        // Accumulate relevant perf counters
+        const angle::VulkanPerfCounters &from = getPerfCounters();
+        angle::VulkanPerfCounters &to         = contextVk->getPerfCounters();
 
         to.pipelineCreationCacheHits += from.pipelineCreationCacheHits;
         to.pipelineCreationCacheMisses += from.pipelineCreationCacheMisses;
@@ -130,12 +137,6 @@ class LinkTaskVk final : public vk::Context, public LinkTask
         to.pipelineCreationTotalCacheMissesDurationNs +=
             from.pipelineCreationTotalCacheMissesDurationNs;
 
-        // Forward any errors
-        if (mErrorCode != VK_SUCCESS)
-        {
-            contextVk->handleError(mErrorCode, mErrorFile, mErrorFunction, mErrorLine);
-            return angle::Result::Stop;
-        }
         return angle::Result::Continue;
     }
 
@@ -215,15 +216,8 @@ angle::Result LinkTaskVk::linkImpl(const gl::ProgramLinkedResources &resources,
     // - Individual GLES1 tests are long, and this adds a considerable overhead to those tests
     if (!mState.isSeparable() && !mIsGLES1 && getFeatures().warmUpPipelineCacheAtLink.enabled)
     {
-        // Only build the shaders subset of the pipeline if VK_EXT_graphics_pipeline_library is
-        // supported.
-        const vk::GraphicsPipelineSubset subset =
-            getFeatures().supportsGraphicsPipelineLibrary.enabled
-                ? vk::GraphicsPipelineSubset::Shaders
-                : vk::GraphicsPipelineSubset::Complete;
-
         ANGLE_TRY(executableVk->getPipelineCacheWarmUpTasks(
-            mRenderer, mPipelineRobustness, mPipelineProtectedAccess, subset, postLinkSubTasksOut));
+            mRenderer, mPipelineRobustness, mPipelineProtectedAccess, postLinkSubTasksOut));
     }
 
     return angle::Result::Continue;
@@ -266,16 +260,7 @@ void InitDefaultUniformBlock(const std::vector<sh::ShaderVariable> &uniforms,
     VulkanDefaultBlockEncoder blockEncoder;
     sh::GetActiveUniformBlockInfo(uniforms, "", &blockEncoder, blockLayoutMapOut);
 
-    size_t blockSize = blockEncoder.getCurrentOffset();
-
-    // TODO(jmadill): I think we still need a valid block for the pipeline even if zero sized.
-    if (blockSize == 0)
-    {
-        *blockSizeOut = 0;
-        return;
-    }
-
-    *blockSizeOut = blockSize;
+    *blockSizeOut = blockEncoder.getCurrentOffset();
     return;
 }
 
@@ -363,7 +348,7 @@ angle::Result ProgramVk::load(const gl::Context *context,
 {
     ContextVk *contextVk = vk::GetImpl(context);
 
-    // TODO: parallelize program load.  http://anglebug.com/8297
+    // TODO: parallelize program load.  http://anglebug.com/41488637
     *loadTaskOut = {};
 
     return getExecutable()->load(contextVk, mState.isSeparable(), stream, resultOut);

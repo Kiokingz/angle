@@ -30,30 +30,27 @@ def FindSrcDirPath():
     return os.path.dirname(os.path.abspath(os.path.join(__file__, '..')))
 
 ANGLE_CHROMIUM_DEPS = [
-    # Pin build because abseil-cpp is pinned, so its DEF files can't be kept in sync with build.
-    # https://skbug.com/330350366
-    # 'build',
+    'build',
     'buildtools',
     'buildtools/linux64',
     'buildtools/mac',
     'buildtools/reclient',
     'buildtools/win',
     'testing',
-    # Pin abseil-cpp because ANGLE and Dawn share the same build files until Skia is able to build
-    # ToT abseil.
-    # https://skbug.com/330350366
-    # 'third_party/abseil-cpp',
+    'third_party/abseil-cpp',
     'third_party/android_build_tools',
-    'third_party/android_build_tools/aapt2',
+    'third_party/android_build_tools/aapt2/cipd',
     'third_party/android_build_tools/art',
     'third_party/android_build_tools/bundletool',
-    'third_party/android_build_tools/lint',
-    'third_party/android_build_tools/manifest_merger',
+    'third_party/android_build_tools/error_prone/cipd',
+    'third_party/android_build_tools/error_prone_javac/cipd',
+    'third_party/android_build_tools/lint/cipd',
+    'third_party/android_build_tools/manifest_merger/cipd',
     'third_party/android_deps',
     'third_party/android_platform',
     'third_party/android_sdk',
     'third_party/android_sdk/public',
-    'third_party/android_system_sdk',
+    'third_party/android_system_sdk/cipd',
     'third_party/android_toolchain/ndk',
     'third_party/bazel',
     'third_party/catapult',
@@ -68,9 +65,7 @@ ANGLE_CHROMIUM_DEPS = [
     'third_party/jdk/extras',
     'third_party/jinja2',
     'third_party/kotlin_stdlib',
-    # Pin libc++ because abseil-cpp is pinned, so its DEF files can't be kept in sync with libc++.
-    # https://skbug.com/330350366
-    # 'third_party/libc++/src',
+    'third_party/libc++/src',
     'third_party/libc++abi/src',
     'third_party/libjpeg_turbo',
     'third_party/libunwind/src',
@@ -82,17 +77,15 @@ ANGLE_CHROMIUM_DEPS = [
     'third_party/Python-Markdown',
     'third_party/qemu-linux-x64',
     'third_party/qemu-mac-x64',
-    'third_party/r8',
-    'third_party/r8/d8',
+    'third_party/r8/cipd',
+    'third_party/r8/d8/cipd',
     'third_party/requests/src',
-    'third_party/siso',
+    'third_party/siso/cipd',
     'third_party/six',
-    'third_party/turbine',
+    'third_party/turbine/cipd',
     'third_party/zlib',
     'tools/android',
-    # Pin clang because abseil-cpp is pinned, so its DEF files can't be kept in sync with clang.
-    # https://skbug.com/330350366
-    # 'tools/clang',
+    'tools/clang',
     'tools/clang/dsymutil',
     'tools/luci-go',
     'tools/mb',
@@ -101,6 +94,7 @@ ANGLE_CHROMIUM_DEPS = [
     'tools/perf',
     'tools/protoc_wrapper',
     'tools/python',
+    'tools/rust',
     'tools/skia_goldctl/linux',
     'tools/skia_goldctl/mac_amd64',
     'tools/skia_goldctl/mac_arm64',
@@ -319,6 +313,9 @@ def BuildDepsentryDict(deps_dict):
                 dep = {'url': dep}
             if dep.get('dep_type') == 'cipd':
                 result[path] = CipdDepsEntry(path, dep['packages'])
+            elif dep.get('dep_type') == 'gcs':
+                # Ignore GCS deps - there aren't any that we want to sync yet
+                continue
             else:
                 if '@' not in dep['url']:
                     continue

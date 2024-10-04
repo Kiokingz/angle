@@ -306,6 +306,10 @@ TParseContext::TParseContext(TSymbolTable &symt,
       mDirectiveHandler(ext, *mDiagnostics, mShaderVersion, mShaderType),
       mPreprocessor(mDiagnostics, &mDirectiveHandler, angle::pp::PreprocessorSettings(spec)),
       mScanner(nullptr),
+      mMaxExpressionComplexity(static_cast<size_t>(options.limitExpressionComplexity
+                                                       ? resources.MaxExpressionComplexity
+                                                       : std::numeric_limits<size_t>::max())),
+      mMaxStatementDepth(static_cast<size_t>(resources.MaxStatementDepth)),
       mMinProgramTexelOffset(resources.MinProgramTexelOffset),
       mMaxProgramTexelOffset(resources.MaxProgramTexelOffset),
       mMinProgramTextureGatherOffset(resources.MinProgramTextureGatherOffset),
@@ -320,6 +324,7 @@ TParseContext::TParseContext(TSymbolTable &symt,
       mMaxUniformBufferBindings(resources.MaxUniformBufferBindings),
       mMaxVertexAttribs(resources.MaxVertexAttribs),
       mMaxAtomicCounterBindings(resources.MaxAtomicCounterBindings),
+      mMaxAtomicCounterBufferSize(resources.MaxAtomicCounterBufferSize),
       mMaxShaderStorageBufferBindings(resources.MaxShaderStorageBufferBindings),
       mDeclaringFunction(false),
       mGeometryShaderInputPrimitiveType(EptUndefined),
@@ -1256,6 +1261,17 @@ unsigned int TParseContext::checkIsValidArraySize(const TSourceLoc &line, TInter
     return size;
 }
 
+bool TParseContext::checkIsValidArrayDimension(const TSourceLoc &line,
+                                               TVector<unsigned int> *arraySizes)
+{
+    if (arraySizes->size() > mMaxExpressionComplexity)
+    {
+        error(line, "array has too many dimensions", "");
+        return false;
+    }
+    return true;
+}
+
 // See if this qualifier can be an array.
 bool TParseContext::checkIsValidQualifierForArray(const TSourceLoc &line,
                                                   const TPublicType &elementQualifier)
@@ -1349,6 +1365,14 @@ bool TParseContext::checkIsValidTypeAndQualifierForArray(const TSourceLoc &index
         return false;
     }
     return checkIsValidQualifierForArray(indexLocation, elementType);
+}
+
+void TParseContext::checkNestingLevel(const TSourceLoc &line)
+{
+    if (static_cast<size_t>(mLoopNestingLevel + mSwitchNestingLevel) > mMaxStatementDepth)
+    {
+        error(line, "statement is too deeply nested", "");
+    }
 }
 
 // Enforce non-initializer type/qualifier rules.
@@ -2288,14 +2312,14 @@ void TParseContext::checkPixelLocalStorageBindingIsValid(const TSourceLoc &locat
     if (type.isArray())
     {
         // PLS is not allowed in arrays.
-        // TODO(anglebug.com/7279): Consider allowing this once more backends are implemented.
+        // TODO(anglebug.com/40096838): Consider allowing this once more backends are implemented.
         error(location, "pixel local storage handles cannot be aggregated in arrays", "array");
     }
     else if (layoutQualifier.binding < 0)
     {
         error(location, "pixel local storage requires a binding index", "layout qualifier");
     }
-    // TODO(anglebug.com/7279):
+    // TODO(anglebug.com/40096838):
     // else if (binding >= GL_MAX_LOCAL_STORAGE_PLANES_ANGLE)
     // {
     // }
@@ -3113,7 +3137,8 @@ void TParseContext::checkInputOutputTypeIsValidES3(const TQualifier qualifier,
     bool extendedShaderTypes = mShaderVersion >= 320 ||
                                isExtensionEnabled(TExtension::EXT_geometry_shader) ||
                                isExtensionEnabled(TExtension::OES_geometry_shader) ||
-                               isExtensionEnabled(TExtension::EXT_tessellation_shader);
+                               isExtensionEnabled(TExtension::EXT_tessellation_shader) ||
+                               isExtensionEnabled(TExtension::OES_tessellation_shader);
     if (typeContainsIntegers && qualifier != EvqFlatIn && qualifier != EvqFlatOut &&
         (!extendedShaderTypes || mShaderType == GL_FRAGMENT_SHADER))
     {
@@ -3230,6 +3255,26 @@ void TParseContext::checkAtomicCounterOffsetAlignment(const TSourceLoc &location
     {
         error(location, "Offset must be multiple of 4", "atomic counter");
     }
+}
+
+void TParseContext::checkAtomicCounterOffsetLimit(const TSourceLoc &location, const TType &type)
+{
+    TLayoutQualifier layoutQualifier = type.getLayoutQualifier();
+
+    if (layoutQualifier.offset >= mMaxAtomicCounterBufferSize)
+    {
+        error(location, "Offset must not exceed the maximum atomic counter buffer size",
+              "atomic counter");
+    }
+}
+
+void TParseContext::checkAtomicCounterOffsetIsValid(bool forceAppend,
+                                                    const TSourceLoc &loc,
+                                                    TType *type)
+{
+    checkAtomicCounterOffsetDoesNotOverlap(forceAppend, loc, type);
+    checkAtomicCounterOffsetAlignment(loc, *type);
+    checkAtomicCounterOffsetLimit(loc, *type);
 }
 
 void TParseContext::checkGeometryShaderInputAndSetArraySize(const TSourceLoc &location,
@@ -3439,9 +3484,7 @@ TIntermDeclaration *TParseContext::parseSingleDeclaration(
 
         if (IsAtomicCounter(type->getBasicType()))
         {
-            checkAtomicCounterOffsetDoesNotOverlap(false, identifierOrTypeLocation, type);
-
-            checkAtomicCounterOffsetAlignment(identifierOrTypeLocation, *type);
+            checkAtomicCounterOffsetIsValid(false, identifierOrTypeLocation, type);
         }
 
         TVariable *variable = nullptr;
@@ -3491,9 +3534,7 @@ TIntermDeclaration *TParseContext::parseSingleArrayDeclaration(
 
     if (IsAtomicCounter(arrayType->getBasicType()))
     {
-        checkAtomicCounterOffsetDoesNotOverlap(false, identifierLocation, arrayType);
-
-        checkAtomicCounterOffsetAlignment(identifierLocation, *arrayType);
+        checkAtomicCounterOffsetIsValid(false, identifierLocation, arrayType);
     }
 
     adjustRedeclaredBuiltInType(identifierLocation, identifier, arrayType);
@@ -3670,9 +3711,7 @@ void TParseContext::parseDeclarator(TPublicType &publicType,
 
     if (IsAtomicCounter(type->getBasicType()))
     {
-        checkAtomicCounterOffsetDoesNotOverlap(true, identifierLocation, type);
-
-        checkAtomicCounterOffsetAlignment(identifierLocation, *type);
+        checkAtomicCounterOffsetIsValid(true, identifierLocation, type);
     }
 
     adjustRedeclaredBuiltInType(identifierLocation, identifier, type);
@@ -4834,7 +4873,8 @@ TIntermDeclaration *TParseContext::addInterfaceBlock(
     }
     else if (typeQualifier.qualifier == EvqPatchOut)
     {
-        if ((!isExtensionEnabled(TExtension::EXT_tessellation_shader) && mShaderVersion < 320) ||
+        if ((!isExtensionEnabled(TExtension::EXT_tessellation_shader) &&
+             !isExtensionEnabled(TExtension::OES_tessellation_shader) && mShaderVersion < 320) ||
             mShaderType != GL_TESS_CONTROL_SHADER)
         {
             error(typeQualifier.line,
@@ -4844,7 +4884,8 @@ TIntermDeclaration *TParseContext::addInterfaceBlock(
     }
     else if (typeQualifier.qualifier == EvqPatchIn)
     {
-        if ((!isExtensionEnabled(TExtension::EXT_tessellation_shader) && mShaderVersion < 320) ||
+        if ((!isExtensionEnabled(TExtension::EXT_tessellation_shader) &&
+             !isExtensionEnabled(TExtension::OES_tessellation_shader) && mShaderVersion < 320) ||
             mShaderType != GL_TESS_EVALUATION_SHADER)
         {
             error(typeQualifier.line,
@@ -5304,8 +5345,9 @@ TIntermTyped *TParseContext::addIndexExpression(TIntermTyped *baseExpression,
 
     // ES3.2 or ES3.1's EXT_gpu_shader5 allow dynamically uniform expressions to be used as indices
     // of opaque types (samplers and atomic counters) as well as UBOs, but not SSBOs and images.
-    bool allowUniformIndices =
-        mShaderVersion >= 320 || isExtensionEnabled(TExtension::EXT_gpu_shader5);
+    bool allowUniformIndices = mShaderVersion >= 320 ||
+                               isExtensionEnabled(TExtension::EXT_gpu_shader5) ||
+                               isExtensionEnabled(TExtension::OES_gpu_shader5);
 
     // ANGLE should be able to fold any constant expressions resulting in an integer - but to be
     // safe we don't treat "EvqConst" that's evaluated according to the spec as being sufficient
@@ -5798,7 +5840,10 @@ TLayoutQualifier TParseContext::parseLayoutQualifier(const ImmutableString &qual
     }
     else if (mShaderType == GL_TESS_EVALUATION_SHADER_EXT &&
              (mShaderVersion >= 320 ||
-              (checkCanUseExtension(qualifierTypeLine, TExtension::EXT_tessellation_shader) &&
+              (checkCanUseOneOfExtensions(
+                   qualifierTypeLine,
+                   std::array<TExtension, 2u>{{TExtension::EXT_tessellation_shader,
+                                               TExtension::OES_tessellation_shader}}) &&
                checkLayoutQualifierSupported(qualifierTypeLine, qualifierType, 310))))
     {
         if (qualifierType == "triangles")
@@ -6172,7 +6217,10 @@ TLayoutQualifier TParseContext::parseLayoutQualifier(const ImmutableString &qual
     }
     else if (qualifierType == "vertices" && mShaderType == GL_TESS_CONTROL_SHADER_EXT &&
              (mShaderVersion >= 320 ||
-              checkCanUseExtension(qualifierTypeLine, TExtension::EXT_tessellation_shader)))
+              checkCanUseOneOfExtensions(
+                  qualifierTypeLine,
+                  std::array<TExtension, 2u>{
+                      {TExtension::EXT_tessellation_shader, TExtension::OES_tessellation_shader}})))
     {
         parseVertices(intValue, intValueLine, intValueString, &qualifier.vertices);
     }
@@ -6475,7 +6523,27 @@ TTypeSpecifierNonArray TParseContext::addStructure(const TSourceLoc &structLine,
     {
         structSymbolType = SymbolType::Empty;
     }
-    TStructure *structure = new TStructure(&symbolTable, structName, fieldList, structSymbolType);
+
+    // To simplify pulling samplers out of structs, reorder the struct fields to put the samplers at
+    // the end.
+    TFieldList *reorderedFields = new TFieldList;
+    for (TField *field : *fieldList)
+    {
+        if (!IsSampler(field->type()->getBasicType()))
+        {
+            reorderedFields->push_back(field);
+        }
+    }
+    for (TField *field : *fieldList)
+    {
+        if (IsSampler(field->type()->getBasicType()))
+        {
+            reorderedFields->push_back(field);
+        }
+    }
+
+    TStructure *structure =
+        new TStructure(&symbolTable, structName, reorderedFields, structSymbolType);
 
     // Store a bool in the struct if we're at global scope, to allow us to
     // skip the local struct scoping workaround in HLSL.
@@ -7463,8 +7531,9 @@ void TParseContext::checkTextureOffset(TIntermAggregate *functionCall)
 
         // ES3.2 or ES3.1's EXT_gpu_shader5 allow non-const offsets to be passed to
         // textureGatherOffset.
-        bool textureGatherOffsetMustBeConst =
-            mShaderVersion <= 310 && !isExtensionEnabled(TExtension::EXT_gpu_shader5);
+        bool textureGatherOffsetMustBeConst = mShaderVersion <= 310 &&
+                                              !isExtensionEnabled(TExtension::EXT_gpu_shader5) &&
+                                              !isExtensionEnabled(TExtension::OES_gpu_shader5);
 
         bool isOffsetConst =
             offset->getAsTyped()->getQualifier() == EvqConst && offsetConstantUnion != nullptr;
@@ -7880,13 +7949,20 @@ TIntermTyped *TParseContext::addTernarySelection(TIntermTyped *cond,
 
     // ESSL 1.00.17 sections 5.2 and 5.7:
     // Ternary operator is not among the operators allowed for structures/arrays.
-    // ESSL 3.00.6 section 5.7:
-    // Ternary operator support is optional for arrays. No certainty that it works across all
-    // devices with struct either, so we err on the side of caution here. TODO (oetuaho@nvidia.com):
-    // Would be nice to make the spec and implementation agree completely here.
-    if (trueExpression->isArray() || trueExpression->getBasicType() == EbtStruct)
+    // ESSL 3.00 and ESSL 3.10 section 5.7:
+    // Ternary operator supports structs, but array support is optional for arrays.
+    // ESSL 3.20 section 5.7:
+    // Ternary operator supports structs and arrays unconditionally.
+    // In WebGL2 section 5.26, ternary is banned for both arrays and structs.
+    if ((mShaderVersion < 300 || mShaderSpec == SH_WEBGL2_SPEC) && trueExpression->isArray())
     {
-        error(loc, "ternary operator is not allowed for structures or arrays", "?:");
+        error(loc, "ternary operator is not allowed for arrays in ESSL 1.0 and webgl", "?:");
+        return falseExpression;
+    }
+    if ((mShaderVersion < 300 || mShaderSpec == SH_WEBGL2_SPEC) &&
+        trueExpression->getBasicType() == EbtStruct)
+    {
+        error(loc, "ternary operator is not allowed for structures in ESSL 1.0 and webgl", "?:");
         return falseExpression;
     }
     if (trueExpression->getBasicType() == EbtInterfaceBlock)

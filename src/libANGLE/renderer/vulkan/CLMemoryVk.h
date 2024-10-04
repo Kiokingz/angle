@@ -8,6 +8,8 @@
 #ifndef LIBANGLE_RENDERER_VULKAN_CLMEMORYVK_H_
 #define LIBANGLE_RENDERER_VULKAN_CLMEMORYVK_H_
 
+#include "common/SimpleMutex.h"
+
 #include "libANGLE/renderer/vulkan/cl_types.h"
 #include "libANGLE/renderer/vulkan/vk_helpers.h"
 
@@ -23,7 +25,7 @@ class CLMemoryVk : public CLMemoryImpl
   public:
     ~CLMemoryVk() override;
 
-    // TODO: http://anglebug.com/8587
+    // TODO: http://anglebug.com/42267017
     angle::Result createSubBuffer(const cl::Buffer &buffer,
                                   cl::MemFlags flags,
                                   size_t size,
@@ -41,6 +43,13 @@ class CLMemoryVk : public CLMemoryImpl
     angle::Result copyTo(CLMemoryVk *dst, size_t srcOffset, size_t dstOffset, size_t size);
     angle::Result copyFrom(const void *ptr, size_t offset, size_t size);
 
+    bool isWritable()
+    {
+        constexpr VkBufferUsageFlags kWritableUsage =
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        return (getVkUsageFlags() & kWritableUsage) != 0;
+    }
+
     virtual bool isCurrentlyInUse() const = 0;
     virtual size_t getSize() const        = 0;
 
@@ -50,7 +59,7 @@ class CLMemoryVk : public CLMemoryImpl
     CLContextVk *mContext;
     vk::Renderer *mRenderer;
     vk::Allocation mAllocation;
-    std::mutex mMapLock;
+    angle::SimpleMutex mMapLock;
     uint8_t *mMapPtr;
     uint32_t mMapCount;
     CLMemoryVk *mParent;
@@ -71,6 +80,7 @@ class CLBufferVk : public CLMemoryVk
     CLBufferVk *getParent() { return static_cast<CLBufferVk *>(mParent); }
 
     angle::Result create(void *hostPtr);
+
     bool isSubBuffer() const { return mParent != nullptr; }
 
     angle::Result map() override;

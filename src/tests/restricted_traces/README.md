@@ -235,25 +235,10 @@ the file system:
 ```
 adb shell ls -la /sdcard/Android/data/$PACKAGE_NAME/angle_capture
 ```
-Allow the app to run until the `*angledata.gz` file is non-zero and no longer growing. The app
-should continue rendering after that:
+Allow the app to run until the logcat entry indicating the end of the API
+capture. The app should continue rendering after that:
 ```
-$ adb shell ls -s -w 1 /sdcard/Android/data/$PACKAGE_NAME/angle_capture
-30528 angry_birds_2.angledata.gz
-    8 angry_birds_2.cpp
-    4 angry_birds_2.json
-  768 angry_birds_2_001.cpp
-  100 angry_birds_2_002.cpp
-  100 angry_birds_2_003.cpp
-  100 angry_birds_2_004.cpp
-  100 angry_birds_2_005.cpp
-  104 angry_birds_2_006.cpp
-  100 angry_birds_2_007.cpp
-  100 angry_birds_2_008.cpp
-  100 angry_birds_2_009.cpp
-  100 angry_birds_2_010.cpp
-  120 angry_birds_2_011.cpp
-    8 angry_birds_2.h
+ANGLE   : INFO: Finished recording graphics API capture
 ```
 
 ## Pull the trace files
@@ -585,6 +570,21 @@ command:
 
 ```
 src/tests/restricted_traces/retrace_restricted_traces.py --no-swiftshader get_min_reqs $TRACE_GN_PATH [--traces "*"]
+```
+
+If retracing an existing trace, any associated `addExtensionPrerequisite()` calls must be removed from `TracePerfTest.cpp` and
+the tracename.json file must be made writable.
+
+Traces are run with all extensions enabled by default. It may be useful to test with only a subset of extensions.
+This can be done by adding the `--request-extensions` argument to `angle_trace_tests`. Multiple extensions must be contained by quotation
+marks and only a single space can be used as a separator. To run with no extensions enabled, specify a null list -- `""`:
+
+```
+./out/Debug/angle_trace_tests --gtest_filter=*tracename --request-extensions "EXT_color_buffer_float GL_EXT_texture_filter_anisotropic"
+```
+  or
+```
+./out/Debug/angle_trace_tests --gtest_filter=*tracename --request-extensions ""
 ```
 
 ## Extended testing and full trace upgrades

@@ -189,12 +189,13 @@ IGNORED_INCLUDES = {
     b'compiler/translator/hlsl/TranslatorHLSL.h',
     b'compiler/translator/msl/TranslatorMSL.h',
     b'compiler/translator/spirv/TranslatorSPIRV.h',
+    b'compiler/translator/wgsl/TranslatorWGSL.h',
     b'contrib/optimizations/slide_hash_neon.h',
     b'dirent_on_windows.h',
     b'dlopen_fuchsia.h',
     b'kernel/image.h',
+    b'libANGLE/renderer/d3d/d3d11/Device11.h',
     b'libANGLE/renderer/d3d/d3d11/winrt/NativeWindow11WinRT.h',
-    b'libANGLE/renderer/d3d/DeviceD3D.h',
     b'libANGLE/renderer/d3d/DisplayD3D.h',
     b'libANGLE/renderer/d3d/RenderTargetD3D.h',
     b'libANGLE/renderer/gl/cgl/DisplayCGL.h',
@@ -244,7 +245,7 @@ IGNORED_INCLUDES = {
     # erroneously marked as valid includes
     b'rapidjson/...',
     # Validation layers support building with robin hood hashing, but we are not enabling that
-    # See http://anglebug.com/5791
+    # See http://anglebug.com/42264327
     b'robin_hood.h',
     # Validation layers optionally use mimalloc
     b'mimalloc-new-delete.h',
@@ -261,6 +262,10 @@ IGNORED_INCLUDES = {
     b'my_custom_min.h',
     # https://bugs.chromium.org/p/gn/issues/detail?id=311
     b'spirv/unified1/spirv.hpp11',
+    # Behind #if defined(QAT_COMPRESSION_ENABLED) in third_party/zlib/deflate.c
+    b'contrib/qat/deflate_qat.h',
+    # Behind #if defined(TRACY_ENABLE) in third_party/vulkan-validation-layers/src/layers/vulkan/generated/chassis.cpp
+    b'profiling/profiling.h',
 }
 
 IGNORED_INCLUDE_PREFIXES = {

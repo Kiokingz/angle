@@ -398,8 +398,8 @@ GLenum GLVariableType(const TType &type)
         case EbtPixelLocalANGLE:
         case EbtIPixelLocalANGLE:
         case EbtUPixelLocalANGLE:
-            // TODO(anglebug.com/7279): For now, we can expect PLS handles to be rewritten to images
-            // before anyone calls into here.
+            // TODO(anglebug.com/40096838): For now, we can expect PLS handles to be rewritten to
+            // images before anyone calls into here.
             [[fallthrough]];
         default:
             UNREACHABLE();
@@ -812,7 +812,6 @@ bool IsOutputHLSL(ShShaderOutput output)
     {
         case SH_HLSL_3_0_OUTPUT:
         case SH_HLSL_4_1_OUTPUT:
-        case SH_HLSL_4_0_FL9_3_OUTPUT:
             return true;
         default:
             break;
@@ -826,6 +825,10 @@ bool IsOutputSPIRV(ShShaderOutput output)
 bool IsOutputMSL(ShShaderOutput output)
 {
     return output == SH_MSL_METAL_OUTPUT;
+}
+bool IsOutputWGSL(ShShaderOutput output)
+{
+    return output == SH_WGSL_OUTPUT;
 }
 
 bool IsInShaderStorageBlock(TIntermTyped *node)
@@ -1011,7 +1014,7 @@ bool IsPrecisionApplicableToType(TBasicType type)
         case EbtUInt:
         case EbtFloat:
             // TODO: find all types where precision is applicable; for example samplers.
-            // http://anglebug.com/6132
+            // http://anglebug.com/42264661
             return true;
         default:
             return false;

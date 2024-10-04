@@ -22,7 +22,9 @@
 #include <vector>
 
 #include "common/Optional.h"
+#include "common/SimpleMutex.h"
 #include "common/angleutils.h"
+#include "common/hash_containers.h"
 #include "common/mathutil.h"
 #include "common/utilities.h"
 
@@ -376,13 +378,14 @@ class Program final : public LabeledObject, public angle::Subject
         return mLinked;
     }
     bool isBinaryReady(const Context *context);
-    ANGLE_INLINE void cacheProgramBinaryIfNotAlready(const Context *context)
+    ANGLE_INLINE void cacheProgramBinaryIfNecessary(const Context *context)
     {
         // This function helps ensure the program binary is cached, even if the backend waits for
         // post-link tasks without the knowledge of the front-end.
-        if (!mIsBinaryCached && mState.mExecutable->mPostLinkSubTasks.empty())
+        if (!mIsBinaryCached && !mState.mBinaryRetrieveableHint &&
+            mState.mExecutable->mPostLinkSubTasks.empty())
         {
-            cacheProgramBinary(context);
+            cacheProgramBinaryIfNotAlready(context);
         }
     }
 
@@ -466,8 +469,9 @@ class Program final : public LabeledObject, public angle::Subject
         }
     }
 
-    // Writes a program's binary to the output memory buffer.
-    angle::Result serialize(const Context *context, angle::MemoryBuffer *binaryOut);
+    // Writes a program's binary to |mBinary|.
+    angle::Result serialize(const Context *context);
+    const angle::MemoryBuffer &getSerializedBinary() const { return mBinary; }
 
     rx::UniqueSerial serial() const { return mSerial; }
 
@@ -527,7 +531,7 @@ class Program final : public LabeledObject, public angle::Subject
     void waitForPostLinkTasks(const Context *context);
 
     void postResolveLink(const Context *context);
-    void cacheProgramBinary(const Context *context);
+    void cacheProgramBinaryIfNotAlready(const Context *context);
 
     void dumpProgramInfo(const Context *context) const;
 
@@ -561,7 +565,12 @@ class Program final : public LabeledObject, public angle::Subject
     // backends.
     ShaderMap<Shader *> mAttachedShaders;
 
-    std::mutex mHistogramMutex;
+    // A cache of the program binary, prepared by |serialize()|.  OpenGL requires the application to
+    // query the length of the binary first (requiring a call to |serialize()|), and then get the
+    // actual binary.  This cache ensures the second call does not need to call |serialize()| again.
+    angle::MemoryBuffer mBinary;
+
+    angle::SimpleMutex mHistogramMutex;
 };
 }  // namespace gl
 

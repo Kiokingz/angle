@@ -238,7 +238,372 @@ uint8_t PackGLBlendFactor(gl::BlendFactorType blendFactor)
     }
 }
 
-void UnpackAttachmentDesc(Context *context,
+// A struct that contains render pass information derived from RenderPassDesc.  It contains dynamic
+// rendering structs that could be directly used when creating pipelines or starting a render pass.
+// When using render pass objects, the contents are converted to RenderPassInfo.
+struct DynamicRenderingInfo : angle::NonCopyable
+{
+    VkRenderingInfo renderingInfo;
+    // Storage for VkRenderingInfo
+    gl::DrawBuffersArray<VkRenderingAttachmentInfo> colorAttachmentInfo;
+    VkRenderingAttachmentInfo depthAttachmentInfo;
+    VkRenderingAttachmentInfo stencilAttachmentInfo;
+
+    // Attachment formats for VkPipelineRenderingCreateInfo and
+    // VkCommandBufferInheritanceRenderingInfo.
+    gl::DrawBuffersArray<VkFormat> colorAttachmentFormats;
+    VkFormat depthAttachmentFormat;
+    VkFormat stencilAttachmentFormat;
+
+    // Attachment and input location mapping for VkRenderingAttachmentLocationInfoKHR and
+    // VkRenderingInputAttachmentIndexInfoKHR respectively.
+    gl::DrawBuffersArray<uint32_t> colorAttachmentLocations;
+
+    // Support for VK_EXT_multisampled_render_to_single_sampled
+    VkMultisampledRenderToSingleSampledInfoEXT msrtss;
+
+    // Support for VK_KHR_fragment_shading_rate
+    VkRenderingFragmentShadingRateAttachmentInfoKHR fragmentShadingRateInfo;
+
+#if defined(ANGLE_PLATFORM_ANDROID)
+    // For VK_ANDROID_external_format_resolve
+    VkExternalFormatANDROID externalFormat;
+#endif
+};
+
+void UnpackAttachmentInfo(VkImageLayout layout,
+                          RenderPassLoadOp loadOp,
+                          RenderPassStoreOp storeOp,
+                          VkImageLayout resolveLayout,
+                          VkResolveModeFlagBits resolveMode,
+                          VkRenderingAttachmentInfo *infoOut)
+{
+    *infoOut                    = {};
+    infoOut->sType              = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    infoOut->imageLayout        = layout;
+    infoOut->resolveImageLayout = resolveLayout;
+    infoOut->resolveMode        = resolveMode;
+    infoOut->loadOp             = ConvertRenderPassLoadOpToVkLoadOp(loadOp);
+    infoOut->storeOp            = ConvertRenderPassStoreOpToVkStoreOp(storeOp);
+    // The image views and clear values are specified when starting the render pass itself.
+}
+
+enum class DynamicRenderingInfoSubset
+{
+    // The complete info as needed by vkCmdBeginRendering.
+    Full,
+    // Only the subset that is needed for pipeline creation / inheritance info.  Equivalent to a
+    // compatible render pass.  Note that parts of renderingInfo may still be filled, such as
+    // viewMask etc.
+    Pipeline,
+};
+
+void DeriveRenderingInfo(Renderer *renderer,
+                         const RenderPassDesc &desc,
+                         DynamicRenderingInfoSubset subset,
+                         const gl::Rectangle &renderArea,
+                         VkSubpassContents subpassContents,
+                         const FramebufferAttachmentsVector<VkImageView> &attachmentViews,
+                         const vk::AttachmentOpsArray &ops,
+                         const PackedClearValuesArray &clearValues,
+                         uint32_t layerCount,
+                         DynamicRenderingInfo *infoOut)
+{
+    ASSERT(renderer->getFeatures().preferDynamicRendering.enabled);
+    // MSRTT cannot be emulated over dynamic rendering.
+    ASSERT(!renderer->getFeatures().enableMultisampledRenderToTexture.enabled ||
+           renderer->getFeatures().supportsMultisampledRenderToSingleSampled.enabled);
+
+#if defined(ANGLE_ENABLE_ASSERTS)
+    // Try to catch errors if the entire struct is not filled but uninitialized data is
+    // retrieved later.
+    memset(infoOut, 0xab, sizeof(*infoOut));
+#endif
+
+    const bool hasDitheringThroughExtension = desc.isLegacyDitherEnabled();
+    ASSERT(!hasDitheringThroughExtension ||
+           renderer->getFeatures().supportsLegacyDithering.enabled);
+
+    // renderArea and layerCount are determined when beginning the render pass
+    infoOut->renderingInfo       = {};
+    infoOut->renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    infoOut->renderingInfo.flags =
+        hasDitheringThroughExtension ? VK_RENDERING_ENABLE_LEGACY_DITHERING_BIT_EXT : 0;
+    if (subpassContents == VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS)
+    {
+        infoOut->renderingInfo.flags |= VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
+    }
+
+    infoOut->renderingInfo.viewMask =
+        desc.viewCount() > 0 ? angle::BitMask<uint32_t>(desc.viewCount()) : 0;
+
+    // Pack color attachments
+    vk::PackedAttachmentIndex attachmentCount(0);
+    for (uint32_t colorIndexGL = 0; colorIndexGL < desc.colorAttachmentRange(); ++colorIndexGL)
+    {
+        // For dynamic rendering, the mapping of attachments to shader output locations is given in
+        // VkRenderingAttachmentLocationInfoKHR.
+        //
+        // For render pass objects, the mapping is specified by
+        // VkSubpassDescription2::pColorAttachments.
+
+        if (!desc.isColorAttachmentEnabled(colorIndexGL))
+        {
+            ASSERT(!desc.hasColorResolveAttachment(colorIndexGL));
+            continue;
+        }
+
+        infoOut->colorAttachmentLocations[attachmentCount.get()] = colorIndexGL;
+
+        angle::FormatID attachmentFormatID = desc[colorIndexGL];
+        ASSERT(attachmentFormatID != angle::FormatID::NONE);
+
+        // If this render pass uses EXT_srgb_write_control, we need to override the format to its
+        // linear counterpart. Formats that cannot be reinterpreted are exempt from this
+        // requirement.
+        angle::FormatID linearFormat = rx::ConvertToLinear(attachmentFormatID);
+        if (linearFormat != angle::FormatID::NONE)
+        {
+            if (desc.getSRGBWriteControlMode() == gl::SrgbWriteControlMode::Linear)
+            {
+                attachmentFormatID = linearFormat;
+            }
+        }
+        VkFormat attachmentFormat = GetVkFormatFromFormatID(attachmentFormatID);
+
+        const bool isYUVExternalFormat = vk::IsYUVExternalFormat(attachmentFormatID);
+#if defined(ANGLE_PLATFORM_ANDROID)
+        // if yuv, we're going to chain this on to VkCommandBufferInheritanceRenderingInfo and
+        // VkPipelineRenderingCreateInfo (or some VkAttachmentDescription2 if falling back to render
+        // pass objects).
+        if (isYUVExternalFormat)
+        {
+            infoOut->externalFormat = {VK_STRUCTURE_TYPE_EXTERNAL_FORMAT_ANDROID, nullptr, 0};
+
+            const vk::ExternalYuvFormatInfo &externalFormatInfo =
+                renderer->getExternalFormatTable()->getExternalFormatInfo(attachmentFormatID);
+            infoOut->externalFormat.externalFormat = externalFormatInfo.externalFormat;
+            attachmentFormat                       = externalFormatInfo.colorAttachmentFormat;
+        }
+#endif
+
+        ASSERT(attachmentFormat != VK_FORMAT_UNDEFINED);
+        infoOut->colorAttachmentFormats[attachmentCount.get()] = attachmentFormat;
+
+        if (subset == DynamicRenderingInfoSubset::Full)
+        {
+            const VkImageLayout layout = vk::ConvertImageLayoutToVkImageLayout(
+                renderer, static_cast<vk::ImageLayout>(ops[attachmentCount].initialLayout));
+            const VkImageLayout resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            const VkResolveModeFlagBits resolveMode =
+                isYUVExternalFormat ? VK_RESOLVE_MODE_EXTERNAL_FORMAT_DOWNSAMPLE_ANDROID
+                : desc.hasColorResolveAttachment(colorIndexGL) ? VK_RESOLVE_MODE_AVERAGE_BIT
+                                                               : VK_RESOLVE_MODE_NONE;
+            const RenderPassLoadOp loadOp =
+                static_cast<RenderPassLoadOp>(ops[attachmentCount].loadOp);
+            const RenderPassStoreOp storeOp =
+                static_cast<RenderPassStoreOp>(ops[attachmentCount].storeOp);
+
+            UnpackAttachmentInfo(layout, loadOp, storeOp, resolveImageLayout, resolveMode,
+                                 &infoOut->colorAttachmentInfo[attachmentCount.get()]);
+
+            // See description of RenderPassFramebuffer::mImageViews regarding the layout of the
+            // attachmentViews.  In short, the draw attachments are packed, while the resolve
+            // attachments are not.
+            infoOut->colorAttachmentInfo[attachmentCount.get()].imageView =
+                attachmentViews[attachmentCount.get()];
+            if (resolveMode != VK_RESOLVE_MODE_NONE)
+            {
+                infoOut->colorAttachmentInfo[attachmentCount.get()].resolveImageView =
+                    attachmentViews[RenderPassFramebuffer::kColorResolveAttachmentBegin +
+                                    colorIndexGL];
+            }
+            infoOut->colorAttachmentInfo[attachmentCount.get()].clearValue =
+                clearValues[attachmentCount];
+        }
+
+        ++attachmentCount;
+    }
+
+    infoOut->renderingInfo.colorAttachmentCount = attachmentCount.get();
+    infoOut->renderingInfo.pColorAttachments    = infoOut->colorAttachmentInfo.data();
+
+    infoOut->depthAttachmentFormat   = VK_FORMAT_UNDEFINED;
+    infoOut->stencilAttachmentFormat = VK_FORMAT_UNDEFINED;
+
+    // Depth/stencil attachment, if any
+    if (desc.hasDepthStencilAttachment())
+    {
+        const uint32_t depthStencilIndexGL =
+            static_cast<uint32_t>(desc.depthStencilAttachmentIndex());
+
+        const angle::FormatID attachmentFormatID = desc[depthStencilIndexGL];
+        ASSERT(attachmentFormatID != angle::FormatID::NONE);
+        const angle::Format &angleFormat = angle::Format::Get(attachmentFormatID);
+        const VkFormat attachmentFormat  = GetVkFormatFromFormatID(attachmentFormatID);
+
+        infoOut->depthAttachmentFormat =
+            angleFormat.depthBits == 0 ? VK_FORMAT_UNDEFINED : attachmentFormat;
+        infoOut->stencilAttachmentFormat =
+            angleFormat.stencilBits == 0 ? VK_FORMAT_UNDEFINED : attachmentFormat;
+
+        if (subset == DynamicRenderingInfoSubset::Full)
+        {
+            const bool resolveDepth =
+                angleFormat.depthBits != 0 && desc.hasDepthResolveAttachment();
+            const bool resolveStencil =
+                angleFormat.stencilBits != 0 && desc.hasStencilResolveAttachment();
+
+            const VkImageLayout layout = ConvertImageLayoutToVkImageLayout(
+                renderer, static_cast<vk::ImageLayout>(ops[attachmentCount].initialLayout));
+            const VkImageLayout resolveImageLayout =
+                VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            const VkResolveModeFlagBits depthResolveMode =
+                resolveDepth ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT : VK_RESOLVE_MODE_NONE;
+            const VkResolveModeFlagBits stencilResolveMode =
+                resolveStencil ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT : VK_RESOLVE_MODE_NONE;
+            const RenderPassLoadOp loadOp =
+                static_cast<RenderPassLoadOp>(ops[attachmentCount].loadOp);
+            const RenderPassStoreOp storeOp =
+                static_cast<RenderPassStoreOp>(ops[attachmentCount].storeOp);
+            const RenderPassLoadOp stencilLoadOp =
+                static_cast<RenderPassLoadOp>(ops[attachmentCount].stencilLoadOp);
+            const RenderPassStoreOp stencilStoreOp =
+                static_cast<RenderPassStoreOp>(ops[attachmentCount].stencilStoreOp);
+
+            UnpackAttachmentInfo(layout, loadOp, storeOp, resolveImageLayout, depthResolveMode,
+                                 &infoOut->depthAttachmentInfo);
+            UnpackAttachmentInfo(layout, stencilLoadOp, stencilStoreOp, resolveImageLayout,
+                                 stencilResolveMode, &infoOut->stencilAttachmentInfo);
+
+            infoOut->depthAttachmentInfo.imageView = attachmentViews[attachmentCount.get()];
+            if (resolveDepth)
+            {
+                infoOut->depthAttachmentInfo.resolveImageView =
+                    attachmentViews[RenderPassFramebuffer::kDepthStencilResolveAttachment];
+            }
+            infoOut->depthAttachmentInfo.clearValue = clearValues[attachmentCount];
+
+            infoOut->stencilAttachmentInfo.imageView = attachmentViews[attachmentCount.get()];
+            if (resolveStencil)
+            {
+                infoOut->stencilAttachmentInfo.resolveImageView =
+                    attachmentViews[RenderPassFramebuffer::kDepthStencilResolveAttachment];
+            }
+            infoOut->stencilAttachmentInfo.clearValue = clearValues[attachmentCount];
+
+            infoOut->renderingInfo.pDepthAttachment =
+                angleFormat.depthBits == 0 ? nullptr : &infoOut->depthAttachmentInfo;
+            infoOut->renderingInfo.pStencilAttachment =
+                angleFormat.stencilBits == 0 ? nullptr : &infoOut->stencilAttachmentInfo;
+        }
+
+        ++attachmentCount;
+    }
+
+    if (subset == DynamicRenderingInfoSubset::Full)
+    {
+        infoOut->renderingInfo.renderArea.offset.x      = static_cast<uint32_t>(renderArea.x);
+        infoOut->renderingInfo.renderArea.offset.y      = static_cast<uint32_t>(renderArea.y);
+        infoOut->renderingInfo.renderArea.extent.width  = static_cast<uint32_t>(renderArea.width);
+        infoOut->renderingInfo.renderArea.extent.height = static_cast<uint32_t>(renderArea.height);
+        infoOut->renderingInfo.layerCount               = layerCount;
+
+        if (desc.isRenderToTexture())
+        {
+            ASSERT(renderer->getFeatures().supportsMultisampledRenderToSingleSampled.enabled);
+
+            infoOut->msrtss = {};
+            infoOut->msrtss.sType =
+                VK_STRUCTURE_TYPE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_INFO_EXT;
+            infoOut->msrtss.multisampledRenderToSingleSampledEnable = true;
+            infoOut->msrtss.rasterizationSamples                    = gl_vk::GetSamples(
+                desc.samples(), renderer->getFeatures().limitSampleCountTo2.enabled);
+        }
+
+        // Fragment shading rate attachment, if any
+        if (desc.hasFragmentShadingAttachment())
+        {
+            infoOut->fragmentShadingRateInfo = {};
+            infoOut->fragmentShadingRateInfo.sType =
+                VK_STRUCTURE_TYPE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR;
+            infoOut->fragmentShadingRateInfo.imageView = attachmentViews[attachmentCount.get()];
+            infoOut->fragmentShadingRateInfo.imageLayout =
+                VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR;
+            infoOut->fragmentShadingRateInfo.shadingRateAttachmentTexelSize =
+                renderer->getMaxFragmentShadingRateAttachmentTexelSize();
+
+            AddToPNextChain(&infoOut->renderingInfo, &infoOut->fragmentShadingRateInfo);
+        }
+    }
+}
+
+void AttachPipelineRenderingInfo(Context *context,
+                                 const RenderPassDesc &desc,
+                                 const DynamicRenderingInfo &renderingInfo,
+                                 GraphicsPipelineSubset subset,
+                                 VkPipelineRenderingCreateInfoKHR *pipelineRenderingInfoOut,
+                                 VkRenderingAttachmentLocationInfoKHR *attachmentLocationsOut,
+                                 VkRenderingInputAttachmentIndexInfoKHR *inputLocationsOut,
+                                 VkPipelineCreateFlags2CreateInfoKHR *createFlags2,
+                                 VkGraphicsPipelineCreateInfo *createInfoOut)
+{
+    *pipelineRenderingInfoOut          = {};
+    pipelineRenderingInfoOut->sType    = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    pipelineRenderingInfoOut->viewMask = renderingInfo.renderingInfo.viewMask;
+    // Note: the formats only affect the fragment output subset.
+    if (GraphicsPipelineHasFragmentOutput(subset))
+    {
+        pipelineRenderingInfoOut->colorAttachmentCount =
+            renderingInfo.renderingInfo.colorAttachmentCount;
+        pipelineRenderingInfoOut->pColorAttachmentFormats =
+            renderingInfo.colorAttachmentFormats.data();
+        pipelineRenderingInfoOut->depthAttachmentFormat   = renderingInfo.depthAttachmentFormat;
+        pipelineRenderingInfoOut->stencilAttachmentFormat = renderingInfo.stencilAttachmentFormat;
+    }
+    AddToPNextChain(createInfoOut, pipelineRenderingInfoOut);
+
+    *attachmentLocationsOut       = {};
+    attachmentLocationsOut->sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO_KHR;
+    attachmentLocationsOut->colorAttachmentCount = renderingInfo.renderingInfo.colorAttachmentCount;
+    attachmentLocationsOut->pColorAttachmentLocations =
+        renderingInfo.colorAttachmentLocations.data();
+    AddToPNextChain(createInfoOut, attachmentLocationsOut);
+
+    // Note: VkRenderingInputAttachmentIndexInfoKHR only affects the fragment stage subset.
+    if (desc.hasFramebufferFetch() && GraphicsPipelineHasShaders(subset))
+    {
+        *inputLocationsOut       = {};
+        inputLocationsOut->sType = VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO_KHR;
+        inputLocationsOut->colorAttachmentCount = renderingInfo.renderingInfo.colorAttachmentCount;
+        inputLocationsOut->pColorAttachmentInputIndices =
+            renderingInfo.colorAttachmentLocations.data();
+
+        AddToPNextChain(createInfoOut, inputLocationsOut);
+    }
+
+    if (desc.hasFragmentShadingAttachment())
+    {
+        createInfoOut->flags |=
+            VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
+    }
+
+    if (desc.isLegacyDitherEnabled())
+    {
+        ASSERT(context->getFeatures().supportsMaintenance5.enabled);
+        ASSERT(context->getFeatures().supportsLegacyDithering.enabled);
+
+        *createFlags2       = {};
+        createFlags2->sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR;
+        createFlags2->flags = createInfoOut->flags;
+        createFlags2->flags |= VK_PIPELINE_CREATE_2_ENABLE_LEGACY_DITHERING_BIT_EXT;
+        createInfoOut->flags = 0;
+
+        AddToPNextChain(createInfoOut, createFlags2);
+    }
+}
+
+void UnpackAttachmentDesc(Renderer *renderer,
                           VkAttachmentDescription2 *desc,
                           angle::FormatID formatID,
                           uint8_t samples,
@@ -247,7 +612,7 @@ void UnpackAttachmentDesc(Context *context,
     *desc         = {};
     desc->sType   = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2;
     desc->format  = GetVkFormatFromFormatID(formatID);
-    desc->samples = gl_vk::GetSamples(samples, context->getFeatures().limitSampleCountTo2.enabled);
+    desc->samples = gl_vk::GetSamples(samples, renderer->getFeatures().limitSampleCountTo2.enabled);
     desc->loadOp  = ConvertRenderPassLoadOpToVkLoadOp(static_cast<RenderPassLoadOp>(ops.loadOp));
     desc->storeOp =
         ConvertRenderPassStoreOpToVkStoreOp(static_cast<RenderPassStoreOp>(ops.storeOp));
@@ -256,9 +621,9 @@ void UnpackAttachmentDesc(Context *context,
     desc->stencilStoreOp =
         ConvertRenderPassStoreOpToVkStoreOp(static_cast<RenderPassStoreOp>(ops.stencilStoreOp));
     desc->initialLayout =
-        ConvertImageLayoutToVkImageLayout(context, static_cast<ImageLayout>(ops.initialLayout));
+        ConvertImageLayoutToVkImageLayout(renderer, static_cast<ImageLayout>(ops.initialLayout));
     desc->finalLayout =
-        ConvertImageLayoutToVkImageLayout(context, static_cast<ImageLayout>(ops.finalLayout));
+        ConvertImageLayoutToVkImageLayout(renderer, static_cast<ImageLayout>(ops.finalLayout));
 }
 
 struct AttachmentInfo
@@ -270,9 +635,11 @@ struct AttachmentInfo
     bool isUnused;
 };
 
-void UnpackColorResolveAttachmentDesc(VkAttachmentDescription2 *desc,
+void UnpackColorResolveAttachmentDesc(Renderer *renderer,
+                                      VkAttachmentDescription2 *desc,
                                       angle::FormatID formatID,
-                                      const AttachmentInfo &info)
+                                      const AttachmentInfo &info,
+                                      ImageLayout finalLayout)
 {
     *desc        = {};
     desc->sType  = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2;
@@ -297,7 +664,7 @@ void UnpackColorResolveAttachmentDesc(VkAttachmentDescription2 *desc,
     desc->stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     desc->stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     desc->initialLayout  = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    desc->finalLayout    = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    desc->finalLayout    = ConvertImageLayoutToVkImageLayout(renderer, finalLayout);
 }
 
 void UnpackDepthStencilResolveAttachmentDesc(vk::Context *context,
@@ -306,8 +673,6 @@ void UnpackDepthStencilResolveAttachmentDesc(vk::Context *context,
                                              const AttachmentInfo &depthInfo,
                                              const AttachmentInfo &stencilInfo)
 {
-    // There cannot be simultaneous usages of the depth/stencil resolve image, as depth/stencil
-    // resolve currently only comes from depth/stencil renderbuffers.
     *desc        = {};
     desc->sType  = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2;
     desc->format = GetVkFormatFromFormatID(formatID);
@@ -754,8 +1119,11 @@ void InitializeDefaultSubpassSelfDependencies(
         renderer->getFeatures().supportsRasterizationOrderAttachmentAccess.enabled;
     const bool hasBlendOperationAdvanced =
         renderer->getFeatures().supportsBlendOperationAdvanced.enabled;
+    const bool hasCoherentBlendOperationAdvanced =
+        renderer->getFeatures().supportsBlendOperationAdvancedCoherent.enabled;
 
-    if (hasRasterizationOrderAttachmentAccess && !hasBlendOperationAdvanced)
+    if (hasRasterizationOrderAttachmentAccess &&
+        (!hasBlendOperationAdvanced || hasCoherentBlendOperationAdvanced))
     {
         // No need to specify a subpass dependency if VK_EXT_rasterization_order_attachment_access
         // is enabled, as that extension makes this subpass dependency implicit.
@@ -777,7 +1145,7 @@ void InitializeDefaultSubpassSelfDependencies(
         dependency->dstStageMask |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
         dependency->dstAccessMask |= VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
     }
-    if (renderer->getFeatures().supportsBlendOperationAdvanced.enabled)
+    if (hasBlendOperationAdvanced && !hasCoherentBlendOperationAdvanced)
     {
         dependency->dstAccessMask |= VK_ACCESS_COLOR_ATTACHMENT_READ_NONCOHERENT_BIT_EXT;
     }
@@ -792,13 +1160,11 @@ void InitializeMSRTSS(Context *context,
                       uint8_t renderToTextureSamples,
                       VkSubpassDescription2 *subpass,
                       VkSubpassDescriptionDepthStencilResolve *msrtssResolve,
-                      VkMultisampledRenderToSingleSampledInfoEXT *msrtss,
-                      VkMultisampledRenderToSingleSampledInfoGOOGLEX *msrtssGOOGLEX)
+                      VkMultisampledRenderToSingleSampledInfoEXT *msrtss)
 {
     Renderer *renderer = context->getRenderer();
 
-    ASSERT(renderer->getFeatures().supportsMultisampledRenderToSingleSampled.enabled ||
-           renderer->getFeatures().supportsMultisampledRenderToSingleSampledGOOGLEX.enabled);
+    ASSERT(renderer->getFeatures().supportsMultisampledRenderToSingleSampled.enabled);
 
     *msrtssResolve                    = {};
     msrtssResolve->sType              = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_DEPTH_STENCIL_RESOLVE;
@@ -812,22 +1178,8 @@ void InitializeMSRTSS(Context *context,
     msrtss->rasterizationSamples                    = gl_vk::GetSamples(
         renderToTextureSamples, context->getFeatures().limitSampleCountTo2.enabled);
 
-    *msrtssGOOGLEX       = {};
-    msrtssGOOGLEX->sType = VK_STRUCTURE_TYPE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_INFO_GOOGLEX;
-    msrtssGOOGLEX->multisampledRenderToSingleSampledEnable = true;
-    msrtssGOOGLEX->rasterizationSamples                    = msrtss->rasterizationSamples;
-    msrtssGOOGLEX->depthResolveMode                        = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
-    msrtssGOOGLEX->stencilResolveMode                      = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
-
-    if (renderer->getFeatures().supportsMultisampledRenderToSingleSampled.enabled)
-    {
-        // msrtss->pNext is not null so can't use AddToPNextChain
-        AppendToPNextChain(subpass, msrtss);
-    }
-    else
-    {
-        AddToPNextChain(subpass, msrtssGOOGLEX);
-    }
+    // msrtss->pNext is not null so can't use AddToPNextChain
+    AppendToPNextChain(subpass, msrtss);
 }
 
 void SetRenderPassViewMask(Context *context,
@@ -2357,6 +2709,7 @@ angle::Result InitializePipelineFromLibraries(Context *context,
                                               const vk::PipelineHelper &vertexInputPipeline,
                                               const vk::PipelineHelper &shadersPipeline,
                                               const vk::PipelineHelper &fragmentOutputPipeline,
+                                              const vk::GraphicsPipelineDesc &desc,
                                               Pipeline *pipelineOut,
                                               CacheLookUpFeedback *feedbackOut)
 {
@@ -2364,6 +2717,11 @@ angle::Result InitializePipelineFromLibraries(Context *context,
     VkGraphicsPipelineCreateInfo createInfo = {};
     createInfo.sType                        = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
     createInfo.layout                       = pipelineLayout.getHandle();
+
+    if (context->getFeatures().preferDynamicRendering.enabled && desc.getRenderPassFoveation())
+    {
+        createInfo.flags |= VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
+    }
 
     const std::array<VkPipeline, 3> pipelines = {
         vertexInputPipeline.getPipeline().getHandle(),
@@ -2558,6 +2916,23 @@ void RenderPassDesc::removeDepthStencilUnresolveAttachment()
     mUnresolveStencil = false;
 }
 
+PackedAttachmentIndex RenderPassDesc::getPackedColorAttachmentIndex(size_t colorIndexGL)
+{
+    ASSERT(colorIndexGL < colorAttachmentRange());
+    ASSERT(isColorAttachmentEnabled(colorIndexGL));
+
+    vk::PackedAttachmentIndex colorIndexVk(0);
+    for (uint32_t index = 0; index < colorIndexGL; ++index)
+    {
+        if (isColorAttachmentEnabled(index))
+        {
+            ++colorIndexVk;
+        }
+    }
+
+    return colorIndexVk;
+}
+
 RenderPassDesc &RenderPassDesc::operator=(const RenderPassDesc &other)
 {
     memcpy(this, &other, sizeof(RenderPassDesc));
@@ -2586,18 +2961,6 @@ bool RenderPassDesc::hasDepthStencilAttachment() const
     return formatID != angle::FormatID::NONE;
 }
 
-bool RenderPassDesc::hasDepthAttachment() const
-{
-    angle::FormatID formatID = operator[](depthStencilAttachmentIndex());
-    return formatID != angle::FormatID::NONE && angle::Format::Get(formatID).depthBits > 0;
-}
-
-bool RenderPassDesc::hasStencilAttachment() const
-{
-    angle::FormatID formatID = operator[](depthStencilAttachmentIndex());
-    return formatID != angle::FormatID::NONE && angle::Format::Get(formatID).stencilBits > 0;
-}
-
 size_t RenderPassDesc::clearableAttachmentCount() const
 {
     size_t colorAttachmentCount = 0;
@@ -2622,6 +2985,190 @@ size_t RenderPassDesc::attachmentCount() const
 void RenderPassDesc::setLegacyDither(bool enabled)
 {
     SetBitField(mLegacyDitherEnabled, enabled ? 1 : 0);
+}
+
+void RenderPassDesc::beginRenderPass(
+    Context *context,
+    PrimaryCommandBuffer *primary,
+    const RenderPass &renderPass,
+    VkFramebuffer framebuffer,
+    const gl::Rectangle &renderArea,
+    VkSubpassContents subpassContents,
+    PackedClearValuesArray &clearValues,
+    const VkRenderPassAttachmentBeginInfo *attachmentBeginInfo) const
+{
+    VkRenderPassBeginInfo beginInfo    = {};
+    beginInfo.sType                    = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    beginInfo.pNext                    = attachmentBeginInfo;
+    beginInfo.renderPass               = renderPass.getHandle();
+    beginInfo.framebuffer              = framebuffer;
+    beginInfo.renderArea.offset.x      = static_cast<uint32_t>(renderArea.x);
+    beginInfo.renderArea.offset.y      = static_cast<uint32_t>(renderArea.y);
+    beginInfo.renderArea.extent.width  = static_cast<uint32_t>(renderArea.width);
+    beginInfo.renderArea.extent.height = static_cast<uint32_t>(renderArea.height);
+    beginInfo.clearValueCount          = static_cast<uint32_t>(clearableAttachmentCount());
+    beginInfo.pClearValues             = clearValues.data();
+
+    primary->beginRenderPass(beginInfo, subpassContents);
+}
+
+void RenderPassDesc::beginRendering(
+    Context *context,
+    PrimaryCommandBuffer *primary,
+    const gl::Rectangle &renderArea,
+    VkSubpassContents subpassContents,
+    const FramebufferAttachmentsVector<VkImageView> &attachmentViews,
+    const AttachmentOpsArray &ops,
+    PackedClearValuesArray &clearValues,
+    uint32_t layerCount) const
+{
+    DynamicRenderingInfo info;
+    DeriveRenderingInfo(context->getRenderer(), *this, DynamicRenderingInfoSubset::Full, renderArea,
+                        subpassContents, attachmentViews, ops, clearValues, layerCount, &info);
+
+    primary->beginRendering(info.renderingInfo);
+
+    VkRenderingAttachmentLocationInfoKHR attachmentLocations = {};
+    attachmentLocations.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO_KHR;
+    attachmentLocations.colorAttachmentCount      = info.renderingInfo.colorAttachmentCount;
+    attachmentLocations.pColorAttachmentLocations = info.colorAttachmentLocations.data();
+
+    primary->setRenderingAttachmentLocations(&attachmentLocations);
+
+    if (hasFramebufferFetch())
+    {
+        VkRenderingInputAttachmentIndexInfoKHR inputLocations = {};
+        inputLocations.sType = VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO_KHR;
+        inputLocations.colorAttachmentCount         = info.renderingInfo.colorAttachmentCount;
+        inputLocations.pColorAttachmentInputIndices = info.colorAttachmentLocations.data();
+
+        primary->setRenderingInputAttachmentIndicates(&inputLocations);
+    }
+}
+
+void RenderPassDesc::populateRenderingInheritanceInfo(
+    Renderer *renderer,
+    VkCommandBufferInheritanceRenderingInfo *infoOut,
+    gl::DrawBuffersArray<VkFormat> *colorFormatStorageOut) const
+{
+    DynamicRenderingInfo renderingInfo;
+    DeriveRenderingInfo(renderer, *this, DynamicRenderingInfoSubset::Pipeline, {},
+                        VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS, {}, {}, {}, 0,
+                        &renderingInfo);
+    *colorFormatStorageOut = renderingInfo.colorAttachmentFormats;
+
+    *infoOut       = {};
+    infoOut->sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO;
+    infoOut->flags = VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
+    if (isLegacyDitherEnabled())
+    {
+        ASSERT(renderer->getFeatures().supportsLegacyDithering.enabled);
+        infoOut->flags |= VK_RENDERING_ENABLE_LEGACY_DITHERING_BIT_EXT;
+    }
+    infoOut->viewMask                = renderingInfo.renderingInfo.viewMask;
+    infoOut->colorAttachmentCount    = renderingInfo.renderingInfo.colorAttachmentCount;
+    infoOut->pColorAttachmentFormats = colorFormatStorageOut->data();
+    infoOut->depthAttachmentFormat   = renderingInfo.depthAttachmentFormat;
+    infoOut->stencilAttachmentFormat = renderingInfo.stencilAttachmentFormat;
+    infoOut->rasterizationSamples =
+        gl_vk::GetSamples(samples(), renderer->getFeatures().limitSampleCountTo2.enabled);
+}
+
+void RenderPassDesc::updatePerfCounters(
+    Context *context,
+    const FramebufferAttachmentsVector<VkImageView> &attachmentViews,
+    const AttachmentOpsArray &ops,
+    angle::VulkanPerfCounters *countersOut)
+{
+    DynamicRenderingInfo info;
+    DeriveRenderingInfo(context->getRenderer(), *this, DynamicRenderingInfoSubset::Full, {},
+                        VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS, attachmentViews, ops, {}, 0,
+                        &info);
+
+    // Note: resolve attachments don't have ops with dynamic rendering and they are implicit.
+    // Counter-tests should take the |preferDynamicRendering| flag into account.  For color, it's
+    // trivial to assume DONT_CARE/STORE, but it gets more complicated with depth/stencil when only
+    // one aspect is resolved.
+
+    for (uint32_t index = 0; index < info.renderingInfo.colorAttachmentCount; ++index)
+    {
+        const VkRenderingAttachmentInfo &colorInfo = info.renderingInfo.pColorAttachments[index];
+        ASSERT(colorInfo.imageView != VK_NULL_HANDLE);
+
+        countersOut->colorLoadOpClears += colorInfo.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR ? 1 : 0;
+        countersOut->colorLoadOpLoads += colorInfo.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD ? 1 : 0;
+        countersOut->colorLoadOpNones += colorInfo.loadOp == VK_ATTACHMENT_LOAD_OP_NONE_EXT ? 1 : 0;
+        countersOut->colorStoreOpStores +=
+            colorInfo.storeOp == VK_ATTACHMENT_STORE_OP_STORE ? 1 : 0;
+        countersOut->colorStoreOpNones +=
+            colorInfo.storeOp == VK_ATTACHMENT_STORE_OP_NONE_EXT ? 1 : 0;
+
+        if (colorInfo.resolveMode != VK_RESOLVE_MODE_NONE)
+        {
+            countersOut->colorStoreOpStores += 1;
+            countersOut->colorAttachmentResolves += 1;
+        }
+    }
+
+    if (info.renderingInfo.pDepthAttachment != nullptr)
+    {
+        ASSERT(info.renderingInfo.pDepthAttachment->imageView != VK_NULL_HANDLE);
+
+        const VkRenderingAttachmentInfo &depthInfo = *info.renderingInfo.pDepthAttachment;
+
+        countersOut->depthLoadOpClears += depthInfo.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR ? 1 : 0;
+        countersOut->depthLoadOpLoads += depthInfo.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD ? 1 : 0;
+        countersOut->depthLoadOpNones += depthInfo.loadOp == VK_ATTACHMENT_LOAD_OP_NONE_EXT ? 1 : 0;
+        countersOut->depthStoreOpStores +=
+            depthInfo.storeOp == VK_ATTACHMENT_STORE_OP_STORE ? 1 : 0;
+        countersOut->depthStoreOpNones +=
+            depthInfo.storeOp == VK_ATTACHMENT_STORE_OP_NONE_EXT ? 1 : 0;
+
+        if (depthInfo.resolveMode != VK_RESOLVE_MODE_NONE)
+        {
+            countersOut->depthStoreOpStores += 1;
+            countersOut->depthAttachmentResolves += 1;
+        }
+    }
+
+    if (info.renderingInfo.pStencilAttachment != nullptr)
+    {
+        ASSERT(info.renderingInfo.pStencilAttachment->imageView != VK_NULL_HANDLE);
+
+        const VkRenderingAttachmentInfo &stencilInfo = *info.renderingInfo.pStencilAttachment;
+
+        countersOut->stencilLoadOpClears +=
+            stencilInfo.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR ? 1 : 0;
+        countersOut->stencilLoadOpLoads += stencilInfo.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD ? 1 : 0;
+        countersOut->stencilLoadOpNones +=
+            stencilInfo.loadOp == VK_ATTACHMENT_LOAD_OP_NONE_EXT ? 1 : 0;
+        countersOut->stencilStoreOpStores +=
+            stencilInfo.storeOp == VK_ATTACHMENT_STORE_OP_STORE ? 1 : 0;
+        countersOut->stencilStoreOpNones +=
+            stencilInfo.storeOp == VK_ATTACHMENT_STORE_OP_NONE_EXT ? 1 : 0;
+
+        if (stencilInfo.resolveMode != VK_RESOLVE_MODE_NONE)
+        {
+            countersOut->stencilStoreOpStores += 1;
+            countersOut->stencilAttachmentResolves += 1;
+        }
+    }
+
+    if (info.renderingInfo.pDepthAttachment != nullptr ||
+        info.renderingInfo.pStencilAttachment != nullptr)
+    {
+        ASSERT(info.renderingInfo.pDepthAttachment == nullptr ||
+               info.renderingInfo.pStencilAttachment == nullptr ||
+               info.renderingInfo.pDepthAttachment->imageLayout ==
+                   info.renderingInfo.pStencilAttachment->imageLayout);
+
+        const VkImageLayout layout = info.renderingInfo.pDepthAttachment != nullptr
+                                         ? info.renderingInfo.pDepthAttachment->imageLayout
+                                         : info.renderingInfo.pStencilAttachment->imageLayout;
+
+        countersOut->readOnlyDepthStencilRenderPasses +=
+            layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL ? 1 : 0;
+    }
 }
 
 bool operator==(const RenderPassDesc &lhs, const RenderPassDesc &rhs)
@@ -2877,6 +3424,9 @@ VkResult GraphicsPipelineDesc::initializePipeline(Context *context,
     GraphicsPipelineFragmentOutputVulkanStructs fragmentOutputState;
     GraphicsPipelineDynamicStateList dynamicStateList;
 
+    // With dynamic rendering, there are no render pass objects.
+    ASSERT(!compatibleRenderPass.valid() || !context->getFeatures().preferDynamicRendering.enabled);
+
     VkGraphicsPipelineCreateInfo createInfo = {};
     createInfo.sType                        = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
     createInfo.flags                        = 0;
@@ -3007,6 +3557,24 @@ VkResult GraphicsPipelineDesc::initializePipeline(Context *context,
         feedbackInfo.pPipelineStageCreationFeedbacks    = perStageFeedback.data();
 
         AddToPNextChain(&createInfo, &feedbackInfo);
+    }
+
+    // Attach dynamic rendering info if needed.  This is done last because the flags may need to
+    // be transfered to |VkPipelineCreateFlags2CreateInfoKHR|, so it must be done after every
+    // other flag is set.
+    DynamicRenderingInfo renderingInfo;
+    VkPipelineRenderingCreateInfoKHR pipelineRenderingInfo;
+    VkRenderingAttachmentLocationInfoKHR attachmentLocations;
+    VkRenderingInputAttachmentIndexInfoKHR inputLocations;
+    VkPipelineCreateFlags2CreateInfoKHR createFlags2;
+    if (hasShadersOrFragmentOutput && context->getFeatures().preferDynamicRendering.enabled)
+    {
+        DeriveRenderingInfo(context->getRenderer(), getRenderPassDesc(),
+                            DynamicRenderingInfoSubset::Pipeline, {}, VK_SUBPASS_CONTENTS_INLINE,
+                            {}, {}, {}, 0, &renderingInfo);
+        AttachPipelineRenderingInfo(context, getRenderPassDesc(), renderingInfo, subset,
+                                    &pipelineRenderingInfo, &attachmentLocations, &inputLocations,
+                                    &createFlags2, &createInfo);
     }
 
     VkResult result = pipelineCache->createGraphicsPipeline(context, createInfo, pipelineOut);
@@ -3410,47 +3978,14 @@ void GraphicsPipelineDesc::initializePipelineShadersState(
     }
 
     // Dynamic state
-    // Enable depth/stencil only if there is depth stencil attachment. This allows ContextVk/UtilsVk
-    // to skip update these state if there is no attachment.
-    const vk::RenderPassDesc renderPassDesc = getRenderPassDesc();
-    if (renderPassDesc.hasDepthAttachment())
-    {
-        dynamicStateListOut->push_back(VK_DYNAMIC_STATE_DEPTH_BIAS);
-        if (context->getRenderer()->useDepthTestEnableDynamicState())
-        {
-            dynamicStateListOut->push_back(VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE);
-        }
-        if (context->getRenderer()->useDepthWriteEnableDynamicState())
-        {
-            dynamicStateListOut->push_back(VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE);
-        }
-        if (context->getRenderer()->useDepthCompareOpDynamicState())
-        {
-            dynamicStateListOut->push_back(VK_DYNAMIC_STATE_DEPTH_COMPARE_OP);
-        }
-        if (context->getRenderer()->useDepthBiasEnableDynamicState())
-        {
-            dynamicStateListOut->push_back(VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE);
-        }
-    }
-    if (renderPassDesc.hasStencilAttachment())
-    {
-        dynamicStateListOut->push_back(VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK);
-        dynamicStateListOut->push_back(VK_DYNAMIC_STATE_STENCIL_WRITE_MASK);
-        dynamicStateListOut->push_back(VK_DYNAMIC_STATE_STENCIL_REFERENCE);
-        if (context->getRenderer()->useStencilTestEnableDynamicState())
-        {
-            dynamicStateListOut->push_back(VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE);
-        }
-        if (context->getRenderer()->useStencilOpDynamicState())
-        {
-            dynamicStateListOut->push_back(VK_DYNAMIC_STATE_STENCIL_OP);
-        }
-    }
-
     dynamicStateListOut->push_back(VK_DYNAMIC_STATE_VIEWPORT);
     dynamicStateListOut->push_back(VK_DYNAMIC_STATE_SCISSOR);
     dynamicStateListOut->push_back(VK_DYNAMIC_STATE_LINE_WIDTH);
+    dynamicStateListOut->push_back(VK_DYNAMIC_STATE_DEPTH_BIAS);
+    dynamicStateListOut->push_back(VK_DYNAMIC_STATE_DEPTH_BOUNDS);
+    dynamicStateListOut->push_back(VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK);
+    dynamicStateListOut->push_back(VK_DYNAMIC_STATE_STENCIL_WRITE_MASK);
+    dynamicStateListOut->push_back(VK_DYNAMIC_STATE_STENCIL_REFERENCE);
     if (context->getRenderer()->useCullModeDynamicState())
     {
         dynamicStateListOut->push_back(VK_DYNAMIC_STATE_CULL_MODE_EXT);
@@ -3459,9 +3994,33 @@ void GraphicsPipelineDesc::initializePipelineShadersState(
     {
         dynamicStateListOut->push_back(VK_DYNAMIC_STATE_FRONT_FACE_EXT);
     }
+    if (context->getRenderer()->useDepthTestEnableDynamicState())
+    {
+        dynamicStateListOut->push_back(VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE);
+    }
+    if (context->getRenderer()->useDepthWriteEnableDynamicState())
+    {
+        dynamicStateListOut->push_back(VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE);
+    }
+    if (context->getRenderer()->useDepthCompareOpDynamicState())
+    {
+        dynamicStateListOut->push_back(VK_DYNAMIC_STATE_DEPTH_COMPARE_OP);
+    }
+    if (context->getRenderer()->useStencilTestEnableDynamicState())
+    {
+        dynamicStateListOut->push_back(VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE);
+    }
+    if (context->getRenderer()->useStencilOpDynamicState())
+    {
+        dynamicStateListOut->push_back(VK_DYNAMIC_STATE_STENCIL_OP);
+    }
     if (context->getRenderer()->useRasterizerDiscardEnableDynamicState())
     {
         dynamicStateListOut->push_back(VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE);
+    }
+    if (context->getRenderer()->useDepthBiasEnableDynamicState())
+    {
+        dynamicStateListOut->push_back(VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE);
     }
     if (context->getFeatures().supportsFragmentShadingRate.enabled)
     {
@@ -3544,10 +4103,20 @@ void GraphicsPipelineDesc::initializePipelineFragmentOutputState(
 
     const PackedColorBlendState &colorBlend = mFragmentOutput.blend;
 
+    // With render pass objects, the blend state is indexed by the subpass-mapped locations.
+    // With dynamic rendering, it is indexed by the actual attachment index.
+    uint32_t colorAttachmentIndex = 0;
     for (uint32_t colorIndexGL = 0; colorIndexGL < stateOut->blendState.attachmentCount;
          ++colorIndexGL)
     {
-        VkPipelineColorBlendAttachmentState &state = stateOut->blendAttachmentState[colorIndexGL];
+        if (context->getFeatures().preferDynamicRendering.enabled &&
+            !mSharedNonVertexInput.renderPass.isColorAttachmentEnabled(colorIndexGL))
+        {
+            continue;
+        }
+
+        VkPipelineColorBlendAttachmentState &state =
+            stateOut->blendAttachmentState[colorAttachmentIndex++];
 
         if (blendEnableMask[colorIndexGL])
         {
@@ -3585,6 +4154,11 @@ void GraphicsPipelineDesc::initializePipelineFragmentOutputState(
             state.colorWriteMask =
                 Int4Array_Get<VkColorComponentFlags>(colorBlend.colorWriteMaskBits, colorIndexGL);
         }
+    }
+
+    if (context->getFeatures().preferDynamicRendering.enabled)
+    {
+        stateOut->blendState.attachmentCount = colorAttachmentIndex;
     }
 
     // Dynamic state
@@ -4249,6 +4823,7 @@ void AttachmentOpsArray::setLayouts(PackedAttachmentIndex index,
     PackedAttachmentOpsDesc &ops = mOps[index.get()];
     SetBitField(ops.initialLayout, initialLayout);
     SetBitField(ops.finalLayout, finalLayout);
+    SetBitField(ops.finalResolveLayout, finalLayout);
 }
 
 void AttachmentOpsArray::setOps(PackedAttachmentIndex index,
@@ -4294,7 +4869,9 @@ bool operator==(const AttachmentOpsArray &lhs, const AttachmentOpsArray &rhs)
 }
 
 // DescriptorSetLayoutDesc implementation.
-DescriptorSetLayoutDesc::DescriptorSetLayoutDesc() : mPackedDescriptorSetLayout{} {}
+DescriptorSetLayoutDesc::DescriptorSetLayoutDesc()
+    : mImmutableSamplers{}, mDescriptorSetLayoutBindings{}
+{}
 
 DescriptorSetLayoutDesc::~DescriptorSetLayoutDesc() = default;
 
@@ -4305,74 +4882,100 @@ DescriptorSetLayoutDesc &DescriptorSetLayoutDesc::operator=(const DescriptorSetL
 
 size_t DescriptorSetLayoutDesc::hash() const
 {
-    return angle::ComputeGenericHash(mPackedDescriptorSetLayout);
+    size_t validDescriptorSetLayoutBindingsCount = mDescriptorSetLayoutBindings.size();
+    size_t validImmutableSamplersCount           = mImmutableSamplers.size();
+
+    ASSERT(validDescriptorSetLayoutBindingsCount != 0 || validImmutableSamplersCount == 0);
+
+    size_t genericHash = 0;
+    if (validDescriptorSetLayoutBindingsCount > 0)
+    {
+        genericHash = angle::ComputeGenericHash(
+            mDescriptorSetLayoutBindings.data(),
+            validDescriptorSetLayoutBindingsCount * sizeof(PackedDescriptorSetBinding));
+    }
+
+    if (validImmutableSamplersCount > 0)
+    {
+        genericHash ^= angle::ComputeGenericHash(mImmutableSamplers.data(),
+                                                 validImmutableSamplersCount * sizeof(VkSampler));
+    }
+
+    return genericHash;
 }
 
 bool DescriptorSetLayoutDesc::operator==(const DescriptorSetLayoutDesc &other) const
 {
-    return memcmp(&mPackedDescriptorSetLayout, &other.mPackedDescriptorSetLayout,
-                  sizeof(mPackedDescriptorSetLayout)) == 0;
+    return mDescriptorSetLayoutBindings == other.mDescriptorSetLayoutBindings &&
+           mImmutableSamplers == other.mImmutableSamplers;
 }
 
-void DescriptorSetLayoutDesc::update(uint32_t bindingIndex,
-                                     VkDescriptorType descriptorType,
-                                     uint32_t count,
-                                     VkShaderStageFlags stages,
-                                     const Sampler *immutableSampler)
+void DescriptorSetLayoutDesc::addBinding(uint32_t bindingIndex,
+                                         VkDescriptorType descriptorType,
+                                         uint32_t count,
+                                         VkShaderStageFlags stages,
+                                         const Sampler *immutableSampler)
 {
-    ASSERT(static_cast<size_t>(descriptorType) < std::numeric_limits<uint16_t>::max());
+    ASSERT(static_cast<uint8_t>(descriptorType) != PackedDescriptorSetBinding::kInvalidType);
+    ASSERT(static_cast<size_t>(descriptorType) < std::numeric_limits<uint8_t>::max());
     ASSERT(count < std::numeric_limits<uint16_t>::max());
+    ASSERT(bindingIndex < std::numeric_limits<uint16_t>::max());
 
-    PackedDescriptorSetBinding &packedBinding = mPackedDescriptorSetLayout[bindingIndex];
+    if (bindingIndex >= mDescriptorSetLayoutBindings.size())
+    {
+        PackedDescriptorSetBinding invalid = {};
+        invalid.type                       = PackedDescriptorSetBinding::kInvalidType;
+        mDescriptorSetLayoutBindings.resize(bindingIndex + 1, invalid);
+    }
 
+    PackedDescriptorSetBinding &packedBinding = mDescriptorSetLayoutBindings[bindingIndex];
+    ASSERT(packedBinding.type == PackedDescriptorSetBinding::kInvalidType);
     SetBitField(packedBinding.type, descriptorType);
     SetBitField(packedBinding.count, count);
     SetBitField(packedBinding.stages, stages);
-    packedBinding.immutableSampler = VK_NULL_HANDLE;
-    packedBinding.pad              = 0;
+    SetBitField(packedBinding.hasImmutableSampler, 0);
 
     if (immutableSampler)
     {
+        if (bindingIndex >= mImmutableSamplers.size())
+        {
+            mImmutableSamplers.resize(bindingIndex + 1);
+        }
+
         ASSERT(count == 1);
-        packedBinding.immutableSampler = immutableSampler->getHandle();
+        SetBitField(packedBinding.hasImmutableSampler, 1);
+        mImmutableSamplers[bindingIndex] = immutableSampler->getHandle();
     }
 }
 
-void DescriptorSetLayoutDesc::unpackBindings(DescriptorSetLayoutBindingVector *bindings,
-                                             std::vector<VkSampler> *immutableSamplers) const
+void DescriptorSetLayoutDesc::unpackBindings(DescriptorSetLayoutBindingVector *bindings) const
 {
-    for (uint32_t bindingIndex = 0; bindingIndex < kMaxDescriptorSetLayoutBindings; ++bindingIndex)
+    // Unpack all valid descriptor set layout bindings
+    for (size_t bindingIndex = 0; bindingIndex < mDescriptorSetLayoutBindings.size();
+         ++bindingIndex)
     {
-        const PackedDescriptorSetBinding &packedBinding = mPackedDescriptorSetLayout[bindingIndex];
-        if (packedBinding.count == 0)
+        const PackedDescriptorSetBinding &packedBinding =
+            mDescriptorSetLayoutBindings[bindingIndex];
+        if (packedBinding.type == PackedDescriptorSetBinding::kInvalidType)
+        {
             continue;
+        }
+
+        ASSERT(packedBinding.count != 0);
 
         VkDescriptorSetLayoutBinding binding = {};
-        binding.binding                      = bindingIndex;
+        binding.binding                      = static_cast<uint32_t>(bindingIndex);
         binding.descriptorCount              = packedBinding.count;
         binding.descriptorType               = static_cast<VkDescriptorType>(packedBinding.type);
         binding.stageFlags = static_cast<VkShaderStageFlags>(packedBinding.stages);
-        if (packedBinding.immutableSampler != VK_NULL_HANDLE)
+
+        if (packedBinding.hasImmutableSampler)
         {
             ASSERT(packedBinding.count == 1);
-            immutableSamplers->push_back(packedBinding.immutableSampler);
-            binding.pImmutableSamplers = reinterpret_cast<const VkSampler *>(angle::DirtyPointer);
+            binding.pImmutableSamplers = &mImmutableSamplers[bindingIndex];
         }
 
         bindings->push_back(binding);
-    }
-    if (!immutableSamplers->empty())
-    {
-        // Patch up pImmutableSampler addresses now that the vector is stable
-        int immutableIndex = 0;
-        for (VkDescriptorSetLayoutBinding &binding : *bindings)
-        {
-            if (binding.pImmutableSamplers)
-            {
-                binding.pImmutableSamplers = &(*immutableSamplers)[immutableIndex];
-                immutableIndex++;
-            }
-        }
     }
 }
 
@@ -4394,12 +4997,18 @@ PipelineLayoutDesc &PipelineLayoutDesc::operator=(const PipelineLayoutDesc &rhs)
 
 size_t PipelineLayoutDesc::hash() const
 {
-    return angle::ComputeGenericHash(*this);
+    size_t genericHash = angle::ComputeGenericHash(mPushConstantRange);
+    for (const DescriptorSetLayoutDesc &descriptorSetLayoutDesc : mDescriptorSetLayouts)
+    {
+        genericHash ^= descriptorSetLayoutDesc.hash();
+    }
+    return genericHash;
 }
 
 bool PipelineLayoutDesc::operator==(const PipelineLayoutDesc &other) const
 {
-    return memcmp(this, &other, sizeof(PipelineLayoutDesc)) == 0;
+    return mPushConstantRange == other.mPushConstantRange &&
+           mDescriptorSetLayouts == other.mDescriptorSetLayouts;
 }
 
 void PipelineLayoutDesc::updateDescriptorSetLayout(DescriptorSetIndex setIndex,
@@ -4443,9 +5052,13 @@ void CreateMonolithicPipelineTask::setCompatibleRenderPass(const RenderPass *com
 
 void CreateMonolithicPipelineTask::operator()()
 {
+    const RenderPass unusedRenderPass;
+    const RenderPass *compatibleRenderPass =
+        mCompatibleRenderPass ? mCompatibleRenderPass : &unusedRenderPass;
+
     ANGLE_TRACE_EVENT0("gpu.angle", "CreateMonolithicPipelineTask");
     mResult = mDesc.initializePipeline(this, &mPipelineCache, vk::GraphicsPipelineSubset::Complete,
-                                       *mCompatibleRenderPass, mPipelineLayout, mShaders,
+                                       *compatibleRenderPass, mPipelineLayout, mShaders,
                                        mSpecConsts, &mPipeline, &mFeedback);
 
     if (mRenderer->getFeatures().slowDownMonolithicPipelineCreationForTesting.enabled)
@@ -5435,7 +6048,7 @@ void WriteDescriptorDescs::streamOut(std::ostream &ostr) const
 }
 
 // DescriptorSetDesc implementation.
-void DescriptorSetDesc::updateDescriptorSet(Context *context,
+void DescriptorSetDesc::updateDescriptorSet(Renderer *renderer,
                                             const WriteDescriptorDescs &writeDescriptorDescs,
                                             UpdateDescriptorSetsBuilder *updateBuilder,
                                             const DescriptorDescHandles *handles,
@@ -5512,9 +6125,10 @@ void DescriptorSetDesc::updateDescriptorSet(Context *context,
 
                     ImageLayout imageLayout = static_cast<ImageLayout>(infoDesc.imageLayoutOrRange);
 
-                    imageInfo.imageLayout = ConvertImageLayoutToVkImageLayout(context, imageLayout);
-                    imageInfo.imageView   = handles[infoDescIndex + arrayElement].imageView;
-                    imageInfo.sampler     = handles[infoDescIndex + arrayElement].sampler;
+                    imageInfo.imageLayout =
+                        ConvertImageLayoutToVkImageLayout(renderer, imageLayout);
+                    imageInfo.imageView = handles[infoDescIndex + arrayElement].imageView;
+                    imageInfo.sampler   = handles[infoDescIndex + arrayElement].sampler;
                 }
                 writeSet.pImageInfo = writeImages;
                 break;
@@ -5730,7 +6344,6 @@ angle::Result DescriptorSetDescBuilder::updateFullActiveTextures(
     const gl::ProgramExecutable &executable,
     const gl::ActiveTextureArray<TextureVk *> &textures,
     const gl::SamplerBindingVector &samplers,
-    bool emulateSeamfulCubeMapSampling,
     PipelineType pipelineType,
     const SharedDescriptorSetCacheKey &sharedCacheKey)
 {
@@ -5808,26 +6421,10 @@ angle::Result DescriptorSetDescBuilder::updateFullActiveTextures(
 
                 mHandles[infoIndex].sampler = samplerHelper.get().getHandle();
 
-                // __samplerExternal2DY2YEXT cannot be used with
-                // emulateSeamfulCubeMapSampling because that's only enabled in GLES == 2.
-                // Use the read image view here anyway.
-                if (emulateSeamfulCubeMapSampling && !isSamplerExternalY2Y)
-                {
-                    // If emulating seamful cube mapping, use the fetch image view.  This is
-                    // basically the same image view as read, except it's a 2DArray view for
-                    // cube maps.
-                    const ImageView &imageView =
-                        textureVk->getFetchImageView(context, samplerState.getSRGBDecode(),
-                                                     samplerUniform.isTexelFetchStaticUse());
-                    mHandles[infoIndex].imageView = imageView.getHandle();
-                }
-                else
-                {
-                    const ImageView &imageView = textureVk->getReadImageView(
-                        context, samplerState.getSRGBDecode(),
-                        samplerUniform.isTexelFetchStaticUse(), isSamplerExternalY2Y);
-                    mHandles[infoIndex].imageView = imageView.getHandle();
-                }
+                const ImageView &imageView = textureVk->getReadImageView(
+                    context, samplerState.getSRGBDecode(), samplerUniform.isTexelFetchStaticUse(),
+                    isSamplerExternalY2Y);
+                mHandles[infoIndex].imageView = imageView.getHandle();
             }
         }
     }
@@ -5854,7 +6451,6 @@ void DescriptorSetDescBuilder::setEmptyBuffer(uint32_t infoDescIndex,
 
 template <typename CommandBufferT>
 void DescriptorSetDescBuilder::updateOneShaderBuffer(
-    ContextVk *contextVk,
     CommandBufferT *commandBufferHelper,
     const ShaderInterfaceVariableInfoMap &variableInfoMap,
     const gl::BufferVector &buffers,
@@ -5863,7 +6459,8 @@ void DescriptorSetDescBuilder::updateOneShaderBuffer(
     VkDescriptorType descriptorType,
     VkDeviceSize maxBoundBufferRange,
     const BufferHelper &emptyBuffer,
-    const WriteDescriptorDescs &writeDescriptorDescs)
+    const WriteDescriptorDescs &writeDescriptorDescs,
+    const GLbitfield memoryBarrierBits)
 {
     if (block.activeShaders().none())
     {
@@ -5901,8 +6498,8 @@ void DescriptorSetDescBuilder::updateOneShaderBuffer(
                                  descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     if (isUniformBuffer)
     {
-        commandBufferHelper->bufferRead(contextVk, VK_ACCESS_UNIFORM_READ_BIT,
-                                        block.activeShaders(), &bufferHelper);
+        commandBufferHelper->bufferRead(VK_ACCESS_UNIFORM_READ_BIT, block.activeShaders(),
+                                        &bufferHelper);
     }
     else
     {
@@ -5914,8 +6511,22 @@ void DescriptorSetDescBuilder::updateOneShaderBuffer(
             // marked read-only.  This also helps BufferVk make better decisions during
             // buffer data uploads and copies by knowing that the buffers are not actually
             // being written to.
-            commandBufferHelper->bufferRead(contextVk, VK_ACCESS_SHADER_READ_BIT,
-                                            block.activeShaders(), &bufferHelper);
+            commandBufferHelper->bufferRead(VK_ACCESS_SHADER_READ_BIT, block.activeShaders(),
+                                            &bufferHelper);
+        }
+        else if ((bufferHelper.getCurrentWriteAccess() & VK_ACCESS_SHADER_WRITE_BIT) != 0 &&
+                 (memoryBarrierBits & kBufferMemoryBarrierBits) == 0)
+        {
+            // Buffer is already in shader write access, and this is not from memoryBarrier call,
+            // then skip the WAW barrier since GL spec says driver is not required to insert barrier
+            // here. We still need to maintain object life time tracking here.
+            // Based on discussion here https://gitlab.khronos.org/opengl/API/-/issues/144, the
+            // above check of VK_ACCESS_SHADER_WRITE_BIT bit can be removed and instead rely on app
+            // issue glMemoryBarrier. But almost all usage I am seeing does not issue
+            // glMemoryBarrier before SSBO write. They only issue glMemoryBarrier after the SSBO
+            // write. This is to ensure we do not break the existing usage even if we think they are
+            // out of spec.
+            commandBufferHelper->retainResourceForWrite(&bufferHelper);
         }
         else
         {
@@ -5924,8 +6535,7 @@ void DescriptorSetDescBuilder::updateOneShaderBuffer(
             for (const gl::ShaderType shaderType : block.activeShaders())
             {
                 const vk::PipelineStage pipelineStage = vk::GetPipelineStage(shaderType);
-                commandBufferHelper->bufferWrite(contextVk, accessFlags, pipelineStage,
-                                                 &bufferHelper);
+                commandBufferHelper->bufferWrite(accessFlags, pipelineStage, &bufferHelper);
             }
         }
     }
@@ -5951,7 +6561,6 @@ void DescriptorSetDescBuilder::updateOneShaderBuffer(
 
 template <typename CommandBufferT>
 void DescriptorSetDescBuilder::updateShaderBuffers(
-    ContextVk *contextVk,
     CommandBufferT *commandBufferHelper,
     const gl::ProgramExecutable &executable,
     const ShaderInterfaceVariableInfoMap &variableInfoMap,
@@ -5960,7 +6569,8 @@ void DescriptorSetDescBuilder::updateShaderBuffers(
     VkDescriptorType descriptorType,
     VkDeviceSize maxBoundBufferRange,
     const BufferHelper &emptyBuffer,
-    const WriteDescriptorDescs &writeDescriptorDescs)
+    const WriteDescriptorDescs &writeDescriptorDescs,
+    const GLbitfield memoryBarrierBits)
 {
     const bool isUniformBuffer = descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
                                  descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
@@ -5971,15 +6581,14 @@ void DescriptorSetDescBuilder::updateShaderBuffers(
         const GLuint binding = isUniformBuffer
                                    ? executable.getUniformBlockBinding(blockIndex)
                                    : executable.getShaderStorageBlockBinding(blockIndex);
-        updateOneShaderBuffer(contextVk, commandBufferHelper, variableInfoMap, buffers,
-                              blocks[blockIndex], binding, descriptorType, maxBoundBufferRange,
-                              emptyBuffer, writeDescriptorDescs);
+        updateOneShaderBuffer(commandBufferHelper, variableInfoMap, buffers, blocks[blockIndex],
+                              binding, descriptorType, maxBoundBufferRange, emptyBuffer,
+                              writeDescriptorDescs, memoryBarrierBits);
     }
 }
 
 template <typename CommandBufferT>
 void DescriptorSetDescBuilder::updateAtomicCounters(
-    ContextVk *contextVk,
     CommandBufferT *commandBufferHelper,
     const gl::ProgramExecutable &executable,
     const ShaderInterfaceVariableInfoMap &variableInfoMap,
@@ -6030,8 +6639,7 @@ void DescriptorSetDescBuilder::updateAtomicCounters(
         for (const gl::ShaderType shaderType : atomicCounterBuffer.activeShaders())
         {
             const vk::PipelineStage pipelineStage = vk::GetPipelineStage(shaderType);
-            commandBufferHelper->bufferWrite(contextVk,
-                                             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            commandBufferHelper->bufferWrite(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
                                              pipelineStage, &bufferHelper);
         }
 
@@ -6056,7 +6664,6 @@ void DescriptorSetDescBuilder::updateAtomicCounters(
 
 // Explicit instantiation
 template void DescriptorSetDescBuilder::updateOneShaderBuffer<vk::RenderPassCommandBufferHelper>(
-    ContextVk *contextVk,
     RenderPassCommandBufferHelper *commandBufferHelper,
     const ShaderInterfaceVariableInfoMap &variableInfoMap,
     const gl::BufferVector &buffers,
@@ -6065,10 +6672,10 @@ template void DescriptorSetDescBuilder::updateOneShaderBuffer<vk::RenderPassComm
     VkDescriptorType descriptorType,
     VkDeviceSize maxBoundBufferRange,
     const BufferHelper &emptyBuffer,
-    const WriteDescriptorDescs &writeDescriptorDescs);
+    const WriteDescriptorDescs &writeDescriptorDescs,
+    const GLbitfield memoryBarrierBits);
 
 template void DescriptorSetDescBuilder::updateOneShaderBuffer<OutsideRenderPassCommandBufferHelper>(
-    ContextVk *contextVk,
     OutsideRenderPassCommandBufferHelper *commandBufferHelper,
     const ShaderInterfaceVariableInfoMap &variableInfoMap,
     const gl::BufferVector &buffers,
@@ -6077,10 +6684,10 @@ template void DescriptorSetDescBuilder::updateOneShaderBuffer<OutsideRenderPassC
     VkDescriptorType descriptorType,
     VkDeviceSize maxBoundBufferRange,
     const BufferHelper &emptyBuffer,
-    const WriteDescriptorDescs &writeDescriptorDescs);
+    const WriteDescriptorDescs &writeDescriptorDescs,
+    const GLbitfield memoryBarrierBits);
 
 template void DescriptorSetDescBuilder::updateShaderBuffers<OutsideRenderPassCommandBufferHelper>(
-    ContextVk *contextVk,
     OutsideRenderPassCommandBufferHelper *commandBufferHelper,
     const gl::ProgramExecutable &executable,
     const ShaderInterfaceVariableInfoMap &variableInfoMap,
@@ -6089,10 +6696,10 @@ template void DescriptorSetDescBuilder::updateShaderBuffers<OutsideRenderPassCom
     VkDescriptorType descriptorType,
     VkDeviceSize maxBoundBufferRange,
     const BufferHelper &emptyBuffer,
-    const WriteDescriptorDescs &writeDescriptorDescs);
+    const WriteDescriptorDescs &writeDescriptorDescs,
+    const GLbitfield memoryBarrierBits);
 
 template void DescriptorSetDescBuilder::updateShaderBuffers<RenderPassCommandBufferHelper>(
-    ContextVk *contextVk,
     RenderPassCommandBufferHelper *commandBufferHelper,
     const gl::ProgramExecutable &executable,
     const ShaderInterfaceVariableInfoMap &variableInfoMap,
@@ -6101,10 +6708,10 @@ template void DescriptorSetDescBuilder::updateShaderBuffers<RenderPassCommandBuf
     VkDescriptorType descriptorType,
     VkDeviceSize maxBoundBufferRange,
     const BufferHelper &emptyBuffer,
-    const WriteDescriptorDescs &writeDescriptorDescs);
+    const WriteDescriptorDescs &writeDescriptorDescs,
+    const GLbitfield memoryBarrierBits);
 
 template void DescriptorSetDescBuilder::updateAtomicCounters<OutsideRenderPassCommandBufferHelper>(
-    ContextVk *contextVk,
     OutsideRenderPassCommandBufferHelper *commandBufferHelper,
     const gl::ProgramExecutable &executable,
     const ShaderInterfaceVariableInfoMap &variableInfoMap,
@@ -6115,7 +6722,6 @@ template void DescriptorSetDescBuilder::updateAtomicCounters<OutsideRenderPassCo
     const WriteDescriptorDescs &writeDescriptorDescs);
 
 template void DescriptorSetDescBuilder::updateAtomicCounters<RenderPassCommandBufferHelper>(
-    ContextVk *contextVk,
     RenderPassCommandBufferHelper *commandBufferHelper,
     const gl::ProgramExecutable &executable,
     const ShaderInterfaceVariableInfoMap &variableInfoMap,
@@ -6260,9 +6866,15 @@ angle::Result DescriptorSetDescBuilder::updateInputAttachments(
 
         DescriptorInfoDesc &infoDesc = mDesc.getInfoDesc(infoIndex);
 
-        // We just need any layout that represents GENERAL. The serial is also not totally precise.
+        // We just need any layout that represents GENERAL for render pass objects.  With dynamic
+        // rendering, there's a specific layout.
+        //
+        // The serial is also not totally precise.
         ImageOrBufferViewSubresourceSerial serial = renderTargetVk->getDrawSubresourceSerial();
-        SetBitField(infoDesc.imageLayoutOrRange, ImageLayout::FragmentShaderWrite);
+        SetBitField(infoDesc.imageLayoutOrRange,
+                    context->getFeatures().preferDynamicRendering.enabled
+                        ? ImageLayout::ColorWriteAndInput
+                        : ImageLayout::FragmentShaderWrite);
         infoDesc.imageViewSerialOrOffset = serial.viewSerial.getValue();
         memcpy(&infoDesc.imageSubresourceRange, &serial.subresource, sizeof(uint32_t));
         infoDesc.samplerOrBufferSerial = 0;
@@ -6273,12 +6885,12 @@ angle::Result DescriptorSetDescBuilder::updateInputAttachments(
     return angle::Result::Continue;
 }
 
-void DescriptorSetDescBuilder::updateDescriptorSet(Context *context,
+void DescriptorSetDescBuilder::updateDescriptorSet(Renderer *renderer,
                                                    const WriteDescriptorDescs &writeDescriptorDescs,
                                                    UpdateDescriptorSetsBuilder *updateBuilder,
                                                    VkDescriptorSet descriptorSet) const
 {
-    mDesc.updateDescriptorSet(context, writeDescriptorDescs, updateBuilder, mHandles.data(),
+    mDesc.updateDescriptorSet(renderer, writeDescriptorDescs, updateBuilder, mHandles.data(),
                               descriptorSet);
 }
 
@@ -6383,21 +6995,21 @@ template class SharedCacheKeyManager<SharedFramebufferCacheKey>;
 template class SharedCacheKeyManager<SharedDescriptorSetCacheKey>;
 
 // PipelineCacheAccess implementation.
-std::unique_lock<std::mutex> PipelineCacheAccess::getLock()
+std::unique_lock<angle::SimpleMutex> PipelineCacheAccess::getLock()
 {
     if (mMutex == nullptr)
     {
-        return std::unique_lock<std::mutex>();
+        return std::unique_lock<angle::SimpleMutex>();
     }
 
-    return std::unique_lock<std::mutex>(*mMutex);
+    return std::unique_lock<angle::SimpleMutex>(*mMutex);
 }
 
 VkResult PipelineCacheAccess::createGraphicsPipeline(vk::Context *context,
                                                      const VkGraphicsPipelineCreateInfo &createInfo,
                                                      vk::Pipeline *pipelineOut)
 {
-    std::unique_lock<std::mutex> lock = getLock();
+    std::unique_lock<angle::SimpleMutex> lock = getLock();
 
     return pipelineOut->initGraphics(context->getDevice(), createInfo, *mPipelineCache);
 }
@@ -6406,16 +7018,22 @@ VkResult PipelineCacheAccess::createComputePipeline(vk::Context *context,
                                                     const VkComputePipelineCreateInfo &createInfo,
                                                     vk::Pipeline *pipelineOut)
 {
-    std::unique_lock<std::mutex> lock = getLock();
+    std::unique_lock<angle::SimpleMutex> lock = getLock();
 
     return pipelineOut->initCompute(context->getDevice(), createInfo, *mPipelineCache);
+}
+
+VkResult PipelineCacheAccess::getCacheData(vk::Context *context, size_t *cacheSize, void *cacheData)
+{
+    std::unique_lock<angle::SimpleMutex> lock = getLock();
+    return mPipelineCache->getCacheData(context->getDevice(), cacheSize, cacheData);
 }
 
 void PipelineCacheAccess::merge(Renderer *renderer, const vk::PipelineCache &pipelineCache)
 {
     ASSERT(isThreadSafe());
 
-    std::unique_lock<std::mutex> lock = getLock();
+    std::unique_lock<angle::SimpleMutex> lock = getLock();
 
     mPipelineCache->merge(renderer->getDevice(), 1, pipelineCache.ptr());
 }
@@ -6680,6 +7298,8 @@ angle::Result RenderPassCache::getRenderPassWithOpsImpl(ContextVk *contextVk,
                                                         bool updatePerfCounters,
                                                         const vk::RenderPass **renderPassOut)
 {
+    ASSERT(!contextVk->getFeatures().preferDynamicRendering.enabled);
+
     auto outerIt = mPayload.find(desc);
     if (outerIt != mPayload.end())
     {
@@ -6722,6 +7342,9 @@ angle::Result RenderPassCache::MakeRenderPass(vk::Context *context,
                                               vk::RenderPass *renderPass,
                                               vk::RenderPassPerfCounters *renderPassCounters)
 {
+    ASSERT(!context->getFeatures().preferDynamicRendering.enabled);
+
+    vk::Renderer *renderer                             = context->getRenderer();
     constexpr VkAttachmentReference2 kUnusedAttachment = {VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
                                                           nullptr, VK_ATTACHMENT_UNUSED,
                                                           VK_IMAGE_LAYOUT_UNDEFINED, 0};
@@ -6729,8 +7352,7 @@ angle::Result RenderPassCache::MakeRenderPass(vk::Context *context,
     const bool needInputAttachments = desc.hasFramebufferFetch();
     const bool isRenderToTextureThroughExtension =
         desc.isRenderToTexture() &&
-        (context->getFeatures().supportsMultisampledRenderToSingleSampled.enabled ||
-         context->getFeatures().supportsMultisampledRenderToSingleSampledGOOGLEX.enabled);
+        renderer->getFeatures().supportsMultisampledRenderToSingleSampled.enabled;
     const bool isRenderToTextureThroughEmulation =
         desc.isRenderToTexture() && !isRenderToTextureThroughExtension;
 
@@ -6765,6 +7387,8 @@ angle::Result RenderPassCache::MakeRenderPass(vk::Context *context,
                                               0};
 #endif
 
+    gl::DrawBuffersArray<vk::ImageLayout> colorResolveImageLayout = {};
+
     // Pack color attachments
     vk::PackedAttachmentIndex attachmentCount(0);
     for (uint32_t colorIndexGL = 0; colorIndexGL < desc.colorAttachmentRange(); ++colorIndexGL)
@@ -6787,9 +7411,18 @@ angle::Result RenderPassCache::MakeRenderPass(vk::Context *context,
         angle::FormatID attachmentFormatID = desc[colorIndexGL];
         ASSERT(attachmentFormatID != angle::FormatID::NONE);
 
+        // If this render pass uses EXT_srgb_write_control, we need to override the format to its
+        // linear counterpart. Formats that cannot be reinterpreted are exempt from this
+        // requirement.
+        angle::FormatID linearFormat = rx::ConvertToLinear(attachmentFormatID);
+        if (linearFormat != angle::FormatID::NONE &&
+            desc.getSRGBWriteControlMode() == gl::SrgbWriteControlMode::Linear)
+        {
+            attachmentFormatID = linearFormat;
+        }
+
         bool isYUVExternalFormat = vk::IsYUVExternalFormat(attachmentFormatID);
-        if (isYUVExternalFormat &&
-            context->getRenderer()->nullColorAttachmentWithExternalFormatResolve())
+        if (isYUVExternalFormat && renderer->nullColorAttachmentWithExternalFormatResolve())
         {
             colorAttachmentRefs.push_back(kUnusedAttachment);
             // temporary workaround for ARM driver assertion. Will remove once driver fix lands
@@ -6805,30 +7438,19 @@ angle::Result RenderPassCache::MakeRenderPass(vk::Context *context,
             needInputAttachments
                 ? VK_IMAGE_LAYOUT_GENERAL
                 : vk::ConvertImageLayoutToVkImageLayout(
-                      context, static_cast<vk::ImageLayout>(ops[attachmentCount].initialLayout));
+                      renderer, static_cast<vk::ImageLayout>(ops[attachmentCount].initialLayout));
         colorRef.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         colorAttachmentRefs.push_back(colorRef);
 
-        vk::UnpackAttachmentDesc(context, &attachmentDescs[attachmentCount.get()],
+        vk::UnpackAttachmentDesc(renderer, &attachmentDescs[attachmentCount.get()],
                                  attachmentFormatID, attachmentSamples, ops[attachmentCount]);
-
-        // If this renderpass uses EXT_srgb_write_control, we need to override the format to its
-        // linear counterpart. Formats that cannot be reinterpreted are exempt from this
-        // requirement.
-        angle::FormatID linearFormat = rx::ConvertToLinear(attachmentFormatID);
-        if (linearFormat != angle::FormatID::NONE)
-        {
-            if (desc.getSRGBWriteControlMode() == gl::SrgbWriteControlMode::Linear)
-            {
-                attachmentFormatID = linearFormat;
-            }
-        }
+        colorResolveImageLayout[colorIndexGL] =
+            static_cast<vk::ImageLayout>(ops[attachmentCount].finalResolveLayout);
 
         if (isYUVExternalFormat)
         {
             const vk::ExternalYuvFormatInfo &externalFormatInfo =
-                context->getRenderer()->getExternalFormatTable()->getExternalFormatInfo(
-                    attachmentFormatID);
+                renderer->getExternalFormatTable()->getExternalFormatInfo(attachmentFormatID);
             attachmentDescs[attachmentCount.get()].format =
                 externalFormatInfo.colorAttachmentFormat;
         }
@@ -6862,11 +7484,11 @@ angle::Result RenderPassCache::MakeRenderPass(vk::Context *context,
         depthStencilAttachmentRef.sType      = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2;
         depthStencilAttachmentRef.attachment = attachmentCount.get();
         depthStencilAttachmentRef.layout     = ConvertImageLayoutToVkImageLayout(
-            context, static_cast<vk::ImageLayout>(ops[attachmentCount].initialLayout));
+            renderer, static_cast<vk::ImageLayout>(ops[attachmentCount].initialLayout));
         depthStencilAttachmentRef.aspectMask =
             VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
 
-        vk::UnpackAttachmentDesc(context, &attachmentDescs[attachmentCount.get()],
+        vk::UnpackAttachmentDesc(renderer, &attachmentDescs[attachmentCount.get()],
                                  attachmentFormatID, attachmentSamples, ops[attachmentCount]);
 
         if (isRenderToTextureThroughEmulation)
@@ -6924,17 +7546,17 @@ angle::Result RenderPassCache::MakeRenderPass(vk::Context *context,
 
         const bool isInvalidated = isMSRTTEmulationColorInvalidated.test(colorIndexGL);
 
-        if (isYUVExternalFormat &&
-            context->getRenderer()->nullColorAttachmentWithExternalFormatResolve())
+        if (isYUVExternalFormat && renderer->nullColorAttachmentWithExternalFormatResolve())
         {
-            vk::UnpackAttachmentDesc(context, &attachmentDescs[attachmentCount.get()],
+            vk::UnpackAttachmentDesc(renderer, &attachmentDescs[attachmentCount.get()],
                                      attachmentFormatID, attachmentSamples, ops[attachmentCount]);
         }
         else
         {
             vk::UnpackColorResolveAttachmentDesc(
-                &attachmentDescs[attachmentCount.get()], attachmentFormatID,
-                {desc.hasColorUnresolveAttachment(colorIndexGL), isInvalidated, false});
+                renderer, &attachmentDescs[attachmentCount.get()], attachmentFormatID,
+                {desc.hasColorUnresolveAttachment(colorIndexGL), isInvalidated, false},
+                colorResolveImageLayout[colorIndexGL]);
         }
 
 #if defined(ANGLE_PLATFORM_ANDROID)
@@ -6942,8 +7564,7 @@ angle::Result RenderPassCache::MakeRenderPass(vk::Context *context,
         if (isYUVExternalFormat)
         {
             const vk::ExternalYuvFormatInfo &externalFormatInfo =
-                context->getRenderer()->getExternalFormatTable()->getExternalFormatInfo(
-                    attachmentFormatID);
+                renderer->getExternalFormatTable()->getExternalFormatInfo(attachmentFormatID);
             externalFormat.externalFormat        = externalFormatInfo.externalFormat;
             VkAttachmentDescription2 &attachment = attachmentDescs[attachmentCount.get()];
             attachment.pNext                     = &externalFormat;
@@ -7048,7 +7669,7 @@ angle::Result RenderPassCache::MakeRenderPass(vk::Context *context,
     // Specify rasterization order for color on the subpass when available and
     // there is framebuffer fetch.  This is required when the corresponding
     // flag is set on the pipeline.
-    if (context->getFeatures().supportsRasterizationOrderAttachmentAccess.enabled &&
+    if (renderer->getFeatures().supportsRasterizationOrderAttachmentAccess.enabled &&
         desc.hasFramebufferFetch())
     {
         for (VkSubpassDescription2 &subpass : subpassDesc)
@@ -7058,17 +7679,17 @@ angle::Result RenderPassCache::MakeRenderPass(vk::Context *context,
         }
     }
 
-    if (context->getFeatures().supportsLegacyDithering.enabled && desc.isLegacyDitherEnabled())
+    if (desc.isLegacyDitherEnabled())
     {
+        ASSERT(renderer->getFeatures().supportsLegacyDithering.enabled);
         subpassDesc.back().flags |= VK_SUBPASS_DESCRIPTION_ENABLE_LEGACY_DITHERING_BIT_EXT;
     }
 
     // If depth/stencil is to be resolved, add a VkSubpassDescriptionDepthStencilResolve to the
     // pNext chain of the subpass description.
-    VkSubpassDescriptionDepthStencilResolve depthStencilResolve  = {};
-    VkSubpassDescriptionDepthStencilResolve msrtssResolve        = {};
-    VkMultisampledRenderToSingleSampledInfoEXT msrtss            = {};
-    VkMultisampledRenderToSingleSampledInfoGOOGLEX msrtssGOOGLEX = {};
+    VkSubpassDescriptionDepthStencilResolve depthStencilResolve = {};
+    VkSubpassDescriptionDepthStencilResolve msrtssResolve       = {};
+    VkMultisampledRenderToSingleSampledInfoEXT msrtss           = {};
     if (desc.hasDepthStencilResolveAttachment())
     {
         ASSERT(!isRenderToTextureThroughExtension);
@@ -7078,7 +7699,7 @@ angle::Result RenderPassCache::MakeRenderPass(vk::Context *context,
 
         depthStencilResolve.sType = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_DEPTH_STENCIL_RESOLVE;
 
-        if (!context->getFeatures().supportsDepthStencilIndependentResolveNone.enabled)
+        if (!renderer->getFeatures().supportsDepthStencilIndependentResolveNone.enabled)
         {
             // Assert that depth/stencil is not separately resolved without this feature
             ASSERT(desc.hasDepthResolveAttachment() || angleFormat.depthBits == 0);
@@ -7118,7 +7739,7 @@ angle::Result RenderPassCache::MakeRenderPass(vk::Context *context,
     {
         ASSERT(subpassDesc.size() == 1);
         vk::InitializeMSRTSS(context, renderToTextureSamples, &subpassDesc.back(), &msrtssResolve,
-                             &msrtss, &msrtssGOOGLEX);
+                             &msrtss);
     }
 
     VkFragmentShadingRateAttachmentInfoKHR fragmentShadingRateAttachmentInfo = {};
@@ -7129,7 +7750,7 @@ angle::Result RenderPassCache::MakeRenderPass(vk::Context *context,
         fragmentShadingRateAttachmentInfo.pFragmentShadingRateAttachment =
             &fragmentShadingRateAttachmentRef;
         fragmentShadingRateAttachmentInfo.shadingRateAttachmentTexelSize =
-            context->getRenderer()->getMaxFragmentShadingRateAttachmentTexelSize();
+            renderer->getMaxFragmentShadingRateAttachmentTexelSize();
 
         vk::AddToPNextChain(&subpassDesc.back(), &fragmentShadingRateAttachmentInfo);
     }
@@ -7168,7 +7789,7 @@ angle::Result RenderPassCache::MakeRenderPass(vk::Context *context,
     // If VK_KHR_create_renderpass2 is not supported, we must use core Vulkan 1.0.  This is
     // increasingly uncommon.  Note that extensions that require chaining information to subpasses
     // are automatically not used when this extension is not available.
-    if (!context->getFeatures().supportsRenderpass2.enabled)
+    if (!renderer->getFeatures().supportsRenderpass2.enabled)
     {
         ANGLE_TRY(vk::CreateRenderPass1(context, createInfo, desc.viewCount(), renderPass));
     }
@@ -7287,7 +7908,7 @@ angle::Result GraphicsPipelineCache<Hash>::linkLibraries(
 
     ANGLE_TRY(vk::InitializePipelineFromLibraries(
         context, pipelineCache, pipelineLayout, *vertexInputPipeline, *shadersPipeline,
-        *fragmentOutputPipeline, &newPipeline, &feedback));
+        *fragmentOutputPipeline, desc, &newPipeline, &feedback));
 
     addToCache(PipelineSource::DrawLinked, desc, std::move(newPipeline), feedback, descPtrOut,
                pipelineOut);
@@ -7480,7 +8101,7 @@ angle::Result DescriptorSetLayoutCache::getDescriptorSetLayout(
     vk::AtomicBindingPointer<vk::DescriptorSetLayout> *descriptorSetLayoutOut)
 {
     // Note: this function may be called without holding the share group lock.
-    std::unique_lock<std::mutex> lock(mMutex);
+    std::unique_lock<angle::SimpleMutex> lock(mMutex);
 
     auto iter = mPayload.find(desc);
     if (iter != mPayload.end())
@@ -7491,11 +8112,17 @@ angle::Result DescriptorSetLayoutCache::getDescriptorSetLayout(
         return angle::Result::Continue;
     }
 
+    // If DescriptorSetLayoutDesc is empty, reuse placeholder descriptor set layout handle
+    if (desc.empty())
+    {
+        descriptorSetLayoutOut->set(context->getRenderer()->getDescriptorLayoutForEmptyDesc());
+        return angle::Result::Continue;
+    }
+
     mCacheStats.missAndIncrementSize();
     // We must unpack the descriptor set layout description.
     vk::DescriptorSetLayoutBindingVector bindingVector;
-    std::vector<VkSampler> immutableSamplers;
-    desc.unpackBindings(&bindingVector, &immutableSamplers);
+    desc.unpackBindings(&bindingVector);
 
     VkDescriptorSetLayoutCreateInfo createInfo = {};
     createInfo.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
@@ -7543,7 +8170,7 @@ angle::Result PipelineLayoutCache::getPipelineLayout(
     vk::AtomicBindingPointer<vk::PipelineLayout> *pipelineLayoutOut)
 {
     // Note: this function may be called without holding the share group lock.
-    std::unique_lock<std::mutex> lock(mMutex);
+    std::unique_lock<angle::SimpleMutex> lock(mMutex);
 
     auto iter = mPayload.find(desc);
     if (iter != mPayload.end())
@@ -7562,10 +8189,8 @@ angle::Result PipelineLayoutCache::getPipelineLayout(
         if (layoutPtr.valid())
         {
             VkDescriptorSetLayout setLayout = layoutPtr.get().getHandle();
-            if (setLayout != VK_NULL_HANDLE)
-            {
-                setLayoutHandles.push_back(setLayout);
-            }
+            ASSERT(setLayout != VK_NULL_HANDLE);
+            setLayoutHandles.push_back(setLayout);
         }
     }
 

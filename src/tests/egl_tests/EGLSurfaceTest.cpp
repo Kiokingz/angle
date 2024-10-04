@@ -517,13 +517,13 @@ class EGLSurfaceTest3 : public EGLSurfaceTest
 // at one time, blocking message loops. See http://crbug.com/475085
 TEST_P(EGLSurfaceTest, MessageLoopBug)
 {
-    // http://anglebug.com/3123
+    // http://anglebug.com/42261801
     ANGLE_SKIP_TEST_IF(IsAndroid());
 
-    // http://anglebug.com/3138
+    // http://anglebug.com/42261815
     ANGLE_SKIP_TEST_IF(IsOzone());
 
-    // http://anglebug.com/5485
+    // http://anglebug.com/42264022
     ANGLE_SKIP_TEST_IF(IsIOS());
 
     initializeDisplay();
@@ -537,13 +537,13 @@ TEST_P(EGLSurfaceTest, MessageLoopBug)
 // instead of null.
 TEST_P(EGLSurfaceTest, MessageLoopBugContext)
 {
-    // http://anglebug.com/3123
+    // http://anglebug.com/42261801
     ANGLE_SKIP_TEST_IF(IsAndroid());
 
-    // http://anglebug.com/3138
+    // http://anglebug.com/42261815
     ANGLE_SKIP_TEST_IF(IsOzone());
 
-    // http://anglebug.com/5485
+    // http://anglebug.com/42264022
     ANGLE_SKIP_TEST_IF(IsIOS());
 
     initializeDisplay();
@@ -726,11 +726,11 @@ TEST_P(EGLSurfaceTest, SurfaceUseAfterFreeBug)
 // Test that the window surface is correctly resized after calling swapBuffers
 TEST_P(EGLSurfaceTest, ResizeWindow)
 {
-    // http://anglebug.com/4453
+    // http://anglebug.com/42263074
     ANGLE_SKIP_TEST_IF(isVulkanRenderer() && IsLinux() && IsIntel());
-    // Flaky on Linux SwANGLE http://anglebug.com/4453
+    // Flaky on Linux SwANGLE http://anglebug.com/42263074
     ANGLE_SKIP_TEST_IF(IsLinux() && isSwiftshader());
-    // http://anglebug.com/5485
+    // http://anglebug.com/42264022
     ANGLE_SKIP_TEST_IF(IsIOS());
     ANGLE_SKIP_TEST_IF(IsLinux() && IsARM());
 
@@ -763,7 +763,7 @@ TEST_P(EGLSurfaceTest, ResizeWindow)
     ASSERT_EGL_SUCCESS();
 
     // TODO(syoussefi): the GLX implementation still reads the window size as 64x64 through
-    // XGetGeometry.  http://anglebug.com/3122
+    // XGetGeometry.  http://anglebug.com/42261800
     ANGLE_SKIP_TEST_IF(IsLinux() && IsOpenGL());
 
     eglQuerySurface(mDisplay, mWindowSurface, EGL_HEIGHT, &height);
@@ -784,9 +784,9 @@ TEST_P(EGLSurfaceTest, ResizeWindow)
 // Test that the backbuffer is correctly resized after calling swapBuffers
 TEST_P(EGLSurfaceTest, ResizeWindowWithDraw)
 {
-    // http://anglebug.com/4453
+    // http://anglebug.com/42263074
     ANGLE_SKIP_TEST_IF(IsLinux());
-    // http://anglebug.com/5485
+    // http://anglebug.com/42264022
     ANGLE_SKIP_TEST_IF(IsIOS());
 
     // Necessary for a window resizing test if there is no per-frame window size query
@@ -1259,7 +1259,7 @@ TEST_P(EGLSurfaceTest3, MakeCurrentDifferentSurfaces)
     // Use the same surface for both draw and read
     EXPECT_EGL_TRUE(eglMakeCurrent(mDisplay, firstPbufferSurface, firstPbufferSurface, mContext));
 
-    // TODO(http://www.anglebug.com/6284): Failing with OpenGL ES backend on Android.
+    // TODO(http://www.anglebug.com/42264803): Failing with OpenGL ES backend on Android.
     // Must be after the eglMakeCurrent() so the renderer string is initialized.
     ANGLE_SKIP_TEST_IF(IsOpenGLES() && IsAndroid());
 
@@ -1765,8 +1765,8 @@ TEST_P(EGLSurfaceTest3, BlitBetweenSurfaces)
     // Clear surface1.
     EXPECT_EGL_TRUE(eglMakeCurrent(mDisplay, surface1, surface1, mContext));
 
-    // TODO(http://www.anglebug.com/6284): Failing with OpenGL ES backend on Android and Windows.
-    // Must be after the eglMakeCurrent() so the renderer string is initialized.
+    // TODO(http://www.anglebug.com/42264803): Failing with OpenGL ES backend on Android and
+    // Windows. Must be after the eglMakeCurrent() so the renderer string is initialized.
     ANGLE_SKIP_TEST_IF(IsOpenGLES() && (IsAndroid() || IsWindows()));
 
     glClearColor(kFloatRed.R, kFloatRed.G, kFloatRed.B, kFloatRed.A);
@@ -1816,8 +1816,8 @@ TEST_P(EGLSurfaceTest3, BlitBetweenSurfacesWithDeferredClear)
     // Clear surface1.
     EXPECT_EGL_TRUE(eglMakeCurrent(mDisplay, surface1, surface1, mContext));
 
-    // TODO(http://www.anglebug.com/6284): Failing with OpenGL ES backend on Android and Windows.
-    // Must be after the eglMakeCurrent() so the renderer string is initialized.
+    // TODO(http://www.anglebug.com/42264803): Failing with OpenGL ES backend on Android and
+    // Windows. Must be after the eglMakeCurrent() so the renderer string is initialized.
     ANGLE_SKIP_TEST_IF(IsOpenGLES() && (IsAndroid() || IsWindows()));
 
     glClearColor(kFloatRed.R, kFloatRed.G, kFloatRed.B, kFloatRed.A);
@@ -1850,10 +1850,10 @@ TEST_P(EGLSurfaceTest3, BlitBetweenSurfacesWithDeferredClear)
 // Verify switching between a surface with robust resource init and one without still clears alpha.
 TEST_P(EGLSurfaceTest, RobustResourceInitAndEmulatedAlpha)
 {
-    // http://anglebug.com/5279
+    // http://anglebug.com/42263827
     ANGLE_SKIP_TEST_IF(IsNVIDIA() && isGLRenderer() && IsLinux());
 
-    // http://anglebug.com/5280
+    // http://anglebug.com/40644775
     ANGLE_SKIP_TEST_IF(IsAndroid() && IsNexus5X() && isGLESRenderer());
 
     initializeDisplay();
@@ -2560,6 +2560,78 @@ TEST_P(EGLSingleBufferTest, WaitOneOffSubmission)
 
     eglDestroyContext(mDisplay, context2);
     context2 = EGL_NO_CONTEXT;
+}
+
+// Checks that |WindowSurfaceVk::swamImpl| acquires and process next swapchain image in case of
+// shared present mode, when called from flush.
+TEST_P(EGLSingleBufferTest, AcquireImageFromSwapImpl)
+{
+    ANGLE_SKIP_TEST_IF(!IsEGLDisplayExtensionEnabled(mDisplay, "EGL_KHR_mutable_render_buffer"));
+
+    EGLConfig config = EGL_NO_CONFIG_KHR;
+    ANGLE_SKIP_TEST_IF(!chooseConfig(&config, true));
+
+    EGLContext context = EGL_NO_CONTEXT;
+    EXPECT_EGL_TRUE(createContext(config, &context));
+    ASSERT_EGL_SUCCESS() << "eglCreateContext failed.";
+
+    EGLSurface surface = EGL_NO_SURFACE;
+    OSWindow *osWindow = OSWindow::New();
+    osWindow->initialize("EGLSingleBufferTest", kWidth, kHeight);
+    EXPECT_EGL_TRUE(
+        createWindowSurface(config, osWindow->getNativeWindow(), &surface, EGL_BACK_BUFFER));
+    ASSERT_EGL_SUCCESS() << "eglCreateWindowSurface failed.";
+
+    EXPECT_EGL_TRUE(eglMakeCurrent(mDisplay, surface, surface, context));
+    ASSERT_EGL_SUCCESS() << "eglMakeCurrent failed.";
+
+    if (eglSurfaceAttrib(mDisplay, surface, EGL_RENDER_BUFFER, EGL_SINGLE_BUFFER))
+    {
+        eglSwapBuffers(mDisplay, surface);
+
+        ANGLE_GL_PROGRAM(greenProgram, essl1_shaders::vs::Simple(), essl1_shaders::fs::Green());
+
+        // Draw into the single buffered surface.
+        // Acquire next swapchain image should be deferred (Vulkan back-end).
+        drawQuad(greenProgram, essl1_shaders::PositionAttrib(), 0.5f);
+        glFlush();
+
+        // Prepare auxilary framebuffer.
+        GLRenderbuffer renderBuffer;
+        GLFramebuffer framebuffer;
+        glBindRenderbuffer(GL_RENDERBUFFER, renderBuffer);
+        glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 50, 50);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER,
+                                  renderBuffer);
+        EXPECT_GL_NO_ERROR();
+
+        // Draw into the auxilary framebuffer just to generate commands into the command buffers.
+        // Otherwise below flush will be ignored.
+        drawQuad(greenProgram, essl1_shaders::PositionAttrib(), 0.5f);
+
+        // Switch back to the Windows Surface and perform flush.
+        // In Vulkan back-end flush will translate into |swapImpl| call while acquire next swapchain
+        // image is still deferred. |swapImpl| must perform the acquire in that case, otherwise
+        // ASSERT will trigger in |present|.
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glFlush();
+    }
+    else
+    {
+        std::cout << "EGL_SINGLE_BUFFER mode is not supported." << std::endl;
+    }
+
+    EXPECT_EGL_TRUE(eglMakeCurrent(mDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, context));
+    ASSERT_EGL_SUCCESS() << "eglMakeCurrent - uncurrent failed.";
+
+    eglDestroySurface(mDisplay, surface);
+    surface = EGL_NO_SURFACE;
+    osWindow->destroy();
+    OSWindow::Delete(&osWindow);
+
+    eglDestroyContext(mDisplay, context);
+    context = EGL_NO_CONTEXT;
 }
 
 // Test that setting a surface to EGL_SINGLE_BUFFER after enabling

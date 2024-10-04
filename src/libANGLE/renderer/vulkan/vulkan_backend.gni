@@ -98,6 +98,8 @@ vulkan_backend_sources = [
   "vk_internal_shaders_autogen.cpp",
   "vk_internal_shaders_autogen.h",
   "vk_mandatory_format_support_table_autogen.cpp",
+  "vk_ref_counted_event.cpp",
+  "vk_ref_counted_event.h",
   "vk_renderer.cpp",
   "vk_renderer.h",
   "vk_resource.cpp",
@@ -128,6 +130,10 @@ if (angle_enable_cl) {
     "CLSamplerVk.cpp",
     "CLSamplerVk.h",
     "cl_types.h",
+    "clspv_utils.cpp",
+    "clspv_utils.h",
+    "vk_cl_utils.cpp",
+    "vk_cl_utils.h",
   ]
 }
 
@@ -138,25 +144,27 @@ if (angle_use_vulkan_null_display) {
   ]
 }
 
+vulkan_backend_dma_buf_sources = [
+  "linux/DeviceVkLinux.cpp",
+  "linux/DeviceVkLinux.h",
+  "linux/DisplayVkLinux.cpp",
+  "linux/DisplayVkLinux.h",
+  "linux/DisplayVkOffscreen.cpp",
+  "linux/DisplayVkOffscreen.h",
+  "linux/DmaBufImageSiblingVkLinux.cpp",
+  "linux/DmaBufImageSiblingVkLinux.h",
+  "linux/display/DisplayVkSimple.cpp",
+  "linux/display/DisplayVkSimple.h",
+  "linux/display/WindowSurfaceVkSimple.cpp",
+  "linux/display/WindowSurfaceVkSimple.h",
+  "linux/headless/DisplayVkHeadless.cpp",
+  "linux/headless/DisplayVkHeadless.h",
+  "linux/headless/WindowSurfaceVkHeadless.cpp",
+  "linux/headless/WindowSurfaceVkHeadless.h",
+]
+
 if (is_linux || is_chromeos) {
-  vulkan_backend_sources += [
-    "linux/DeviceVkLinux.cpp",
-    "linux/DeviceVkLinux.h",
-    "linux/DisplayVkLinux.cpp",
-    "linux/DisplayVkLinux.h",
-    "linux/DisplayVkOffscreen.cpp",
-    "linux/DisplayVkOffscreen.h",
-    "linux/DmaBufImageSiblingVkLinux.cpp",
-    "linux/DmaBufImageSiblingVkLinux.h",
-    "linux/display/DisplayVkSimple.cpp",
-    "linux/display/DisplayVkSimple.h",
-    "linux/display/WindowSurfaceVkSimple.cpp",
-    "linux/display/WindowSurfaceVkSimple.h",
-    "linux/headless/DisplayVkHeadless.cpp",
-    "linux/headless/DisplayVkHeadless.h",
-    "linux/headless/WindowSurfaceVkHeadless.cpp",
-    "linux/headless/WindowSurfaceVkHeadless.h",
-  ]
+  vulkan_backend_sources += vulkan_backend_dma_buf_sources
 }
 
 if (is_android) {

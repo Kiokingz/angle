@@ -14,6 +14,7 @@
 #include <stdint.h>
 
 #include "libANGLE/FramebufferAttachment.h"
+#include "libANGLE/renderer/wgpu/wgpu_helpers.h"
 #include "libANGLE/renderer/wgpu/wgpu_utils.h"
 
 namespace rx
@@ -27,17 +28,25 @@ class RenderTargetWgpu final : public FramebufferAttachmentRenderTarget
     // Used in std::vector initialization.
     RenderTargetWgpu(RenderTargetWgpu &&other);
 
-    void set(const wgpu::TextureView &texture,
+    void set(webgpu::ImageHelper *image,
+             const wgpu::TextureView &texture,
              const webgpu::LevelIndex level,
              uint32_t layer,
              const wgpu::TextureFormat &format);
-    void setTexture(const wgpu::TextureView &texture);
     void reset();
 
-    wgpu::TextureView getTexture() { return mTexture; }
+    angle::Result flushImageStagedUpdates(ContextWgpu *contextWgpu,
+                                          webgpu::ClearValuesArray *deferredClears,
+                                          uint32_t deferredClearIndex);
+
+    wgpu::TextureView getTextureView() { return mTextureView; }
+    webgpu::ImageHelper *getImage() { return mImage; }
+    webgpu::LevelIndex getLevelIndex() const { return mLevelIndex; }
 
   private:
-    wgpu::TextureView mTexture;
+    webgpu::ImageHelper *mImage = nullptr;
+    // TODO(liza): move TextureView into ImageHelper.
+    wgpu::TextureView mTextureView;
     webgpu::LevelIndex mLevelIndex{0};
     uint32_t mLayerIndex               = 0;
     const wgpu::TextureFormat *mFormat = nullptr;

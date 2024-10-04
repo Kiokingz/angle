@@ -9,6 +9,7 @@
 
 #include "libANGLE/renderer/renderer_utils.h"
 
+#include "common/base/anglebase/numerics/checked_math.h"
 #include "common/string_utils.h"
 #include "common/system_utils.h"
 #include "common/utilities.h"
@@ -238,7 +239,7 @@ void WriteFloatColor(const gl::ColorF &color,
 }
 
 template <int cols, int rows, bool IsColumnMajor>
-inline int GetFlattenedIndex(int col, int row)
+constexpr inline int GetFlattenedIndex(int col, int row)
 {
     if (IsColumnMajor)
     {
@@ -261,7 +262,10 @@ void ExpandMatrix(T *target, const GLfloat *value)
 {
     static_assert(colsSrc <= colsDst && rowsSrc <= rowsDst, "Can only expand!");
 
-    constexpr int kDstFlatSize = colsDst * rowsDst;
+    // Clamp the staging data's size to the last written value so that data packed just after this
+    // matrix is not overwritten.
+    constexpr int kDstFlatSize =
+        GetFlattenedIndex<colsDst, rowsDst, IsDstColumnMajor>(colsSrc - 1, rowsSrc - 1) + 1;
     T staging[kDstFlatSize]    = {0};
 
     for (int r = 0; r < rowsSrc; r++)
@@ -529,6 +533,32 @@ void PackPixels(const PackPixelsParams &params,
             pixelWriteFunction(temp, dest);
         }
     }
+}
+
+angle::Result GetPackPixelsParams(const gl::InternalFormat &sizedFormatInfo,
+                                  GLuint outputPitch,
+                                  const gl::PixelPackState &packState,
+                                  gl::Buffer *packBuffer,
+                                  const gl::Rectangle &area,
+                                  const gl::Rectangle &clippedArea,
+                                  rx::PackPixelsParams *paramsOut,
+                                  GLuint *skipBytesOut)
+{
+    angle::CheckedNumeric<GLuint> checkedSkipBytes = *skipBytesOut;
+    checkedSkipBytes += (clippedArea.x - area.x) * sizedFormatInfo.pixelBytes +
+                        (clippedArea.y - area.y) * outputPitch;
+    if (!checkedSkipBytes.AssignIfValid(skipBytesOut))
+    {
+        return angle::Result::Stop;
+    }
+
+    angle::FormatID angleFormatID =
+        angle::Format::InternalFormatToID(sizedFormatInfo.sizedInternalFormat);
+    const angle::Format &angleFormat = angle::Format::Get(angleFormatID);
+
+    *paramsOut = rx::PackPixelsParams(clippedArea, angleFormat, outputPitch,
+                                      packState.reverseRowOrder, packBuffer, 0);
+    return angle::Result::Continue;
 }
 
 bool FastCopyFunctionMap::has(angle::FormatID formatID) const
@@ -997,6 +1027,259 @@ void GetMatrixUniform(GLenum type, NonFloatT *dataOut, const NonFloatT *source, 
 {
     UNREACHABLE();
 }
+
+BufferAndLayout::BufferAndLayout() = default;
+
+BufferAndLayout::~BufferAndLayout() = default;
+
+template <typename T>
+void UpdateBufferWithLayout(GLsizei count,
+                            uint32_t arrayIndex,
+                            int componentCount,
+                            const T *v,
+                            const sh::BlockMemberInfo &layoutInfo,
+                            angle::MemoryBuffer *uniformData)
+{
+    const int elementSize = sizeof(T) * componentCount;
+
+    uint8_t *dst = uniformData->data() + layoutInfo.offset;
+    if (layoutInfo.arrayStride == 0 || layoutInfo.arrayStride == elementSize)
+    {
+        uint32_t arrayOffset = arrayIndex * layoutInfo.arrayStride;
+        uint8_t *writePtr    = dst + arrayOffset;
+        ASSERT(writePtr + (elementSize * count) <= uniformData->data() + uniformData->size());
+        memcpy(writePtr, v, elementSize * count);
+    }
+    else
+    {
+        // Have to respect the arrayStride between each element of the array.
+        int maxIndex = arrayIndex + count;
+        for (int writeIndex = arrayIndex, readIndex = 0; writeIndex < maxIndex;
+             writeIndex++, readIndex++)
+        {
+            const int arrayOffset = writeIndex * layoutInfo.arrayStride;
+            uint8_t *writePtr     = dst + arrayOffset;
+            const T *readPtr      = v + (readIndex * componentCount);
+            ASSERT(writePtr + elementSize <= uniformData->data() + uniformData->size());
+            memcpy(writePtr, readPtr, elementSize);
+        }
+    }
+}
+
+template <typename T>
+void ReadFromBufferWithLayout(int componentCount,
+                              uint32_t arrayIndex,
+                              T *dst,
+                              const sh::BlockMemberInfo &layoutInfo,
+                              const angle::MemoryBuffer *uniformData)
+{
+    ASSERT(layoutInfo.offset != -1);
+
+    const int elementSize = sizeof(T) * componentCount;
+    const uint8_t *source = uniformData->data() + layoutInfo.offset;
+
+    if (layoutInfo.arrayStride == 0 || layoutInfo.arrayStride == elementSize)
+    {
+        const uint8_t *readPtr = source + arrayIndex * layoutInfo.arrayStride;
+        memcpy(dst, readPtr, elementSize);
+    }
+    else
+    {
+        // Have to respect the arrayStride between each element of the array.
+        const int arrayOffset  = arrayIndex * layoutInfo.arrayStride;
+        const uint8_t *readPtr = source + arrayOffset;
+        memcpy(dst, readPtr, elementSize);
+    }
+}
+
+template <typename T>
+void SetUniform(const gl::ProgramExecutable *executable,
+                GLint location,
+                GLsizei count,
+                const T *v,
+                GLenum entryPointType,
+                DefaultUniformBlockMap *defaultUniformBlocks,
+                gl::ShaderBitSet *defaultUniformBlocksDirty)
+{
+    const gl::VariableLocation &locationInfo = executable->getUniformLocations()[location];
+    const gl::LinkedUniform &linkedUniform   = executable->getUniforms()[locationInfo.index];
+
+    ASSERT(!linkedUniform.isSampler());
+
+    if (linkedUniform.getType() == entryPointType)
+    {
+        for (const gl::ShaderType shaderType : executable->getLinkedShaderStages())
+        {
+            BufferAndLayout &uniformBlock         = *(*defaultUniformBlocks)[shaderType];
+            const sh::BlockMemberInfo &layoutInfo = uniformBlock.uniformLayout[location];
+
+            // Assume an offset of -1 means the block is unused.
+            if (layoutInfo.offset == -1)
+            {
+                continue;
+            }
+
+            const GLint componentCount = linkedUniform.getElementComponents();
+            UpdateBufferWithLayout(count, locationInfo.arrayIndex, componentCount, v, layoutInfo,
+                                   &uniformBlock.uniformData);
+            defaultUniformBlocksDirty->set(shaderType);
+        }
+    }
+    else
+    {
+        for (const gl::ShaderType shaderType : executable->getLinkedShaderStages())
+        {
+            BufferAndLayout &uniformBlock         = *(*defaultUniformBlocks)[shaderType];
+            const sh::BlockMemberInfo &layoutInfo = uniformBlock.uniformLayout[location];
+
+            // Assume an offset of -1 means the block is unused.
+            if (layoutInfo.offset == -1)
+            {
+                continue;
+            }
+
+            const GLint componentCount = linkedUniform.getElementComponents();
+
+            ASSERT(linkedUniform.getType() == gl::VariableBoolVectorType(entryPointType));
+
+            GLint initialArrayOffset =
+                locationInfo.arrayIndex * layoutInfo.arrayStride + layoutInfo.offset;
+            for (GLint i = 0; i < count; i++)
+            {
+                GLint elementOffset = i * layoutInfo.arrayStride + initialArrayOffset;
+                GLint *dst =
+                    reinterpret_cast<GLint *>(uniformBlock.uniformData.data() + elementOffset);
+                const T *source = v + i * componentCount;
+
+                for (int c = 0; c < componentCount; c++)
+                {
+                    dst[c] = (source[c] == static_cast<T>(0)) ? GL_FALSE : GL_TRUE;
+                }
+            }
+
+            defaultUniformBlocksDirty->set(shaderType);
+        }
+    }
+}
+template void SetUniform<GLint>(const gl::ProgramExecutable *executable,
+                                GLint location,
+                                GLsizei count,
+                                const GLint *v,
+                                GLenum entryPointType,
+                                DefaultUniformBlockMap *defaultUniformBlocks,
+                                gl::ShaderBitSet *defaultUniformBlocksDirty);
+template void SetUniform<GLuint>(const gl::ProgramExecutable *executable,
+                                 GLint location,
+                                 GLsizei count,
+                                 const GLuint *v,
+                                 GLenum entryPointType,
+                                 DefaultUniformBlockMap *defaultUniformBlocks,
+                                 gl::ShaderBitSet *defaultUniformBlocksDirty);
+template void SetUniform<GLfloat>(const gl::ProgramExecutable *executable,
+                                  GLint location,
+                                  GLsizei count,
+                                  const GLfloat *v,
+                                  GLenum entryPointType,
+                                  DefaultUniformBlockMap *defaultUniformBlocks,
+                                  gl::ShaderBitSet *defaultUniformBlocksDirty);
+
+template <int cols, int rows>
+void SetUniformMatrixfv(const gl::ProgramExecutable *executable,
+                        GLint location,
+                        GLsizei count,
+                        GLboolean transpose,
+                        const GLfloat *value,
+                        DefaultUniformBlockMap *defaultUniformBlocks,
+                        gl::ShaderBitSet *defaultUniformBlocksDirty)
+{
+    const gl::VariableLocation &locationInfo = executable->getUniformLocations()[location];
+    const gl::LinkedUniform &linkedUniform   = executable->getUniforms()[locationInfo.index];
+
+    for (const gl::ShaderType shaderType : executable->getLinkedShaderStages())
+    {
+        BufferAndLayout &uniformBlock         = *(*defaultUniformBlocks)[shaderType];
+        const sh::BlockMemberInfo &layoutInfo = uniformBlock.uniformLayout[location];
+
+        // Assume an offset of -1 means the block is unused.
+        if (layoutInfo.offset == -1)
+        {
+            continue;
+        }
+
+        SetFloatUniformMatrixGLSL<cols, rows>::Run(
+            locationInfo.arrayIndex, linkedUniform.getBasicTypeElementCount(), count, transpose,
+            value, uniformBlock.uniformData.data() + layoutInfo.offset);
+
+        defaultUniformBlocksDirty->set(shaderType);
+    }
+}
+
+#define ANGLE_SET_UNIFORM_MATRIX_FV_SPECIALIZATION(cols, rows)                                   \
+    template void SetUniformMatrixfv<cols, rows>(                                                \
+        const gl::ProgramExecutable *executable, GLint location, GLsizei count,                  \
+        GLboolean transpose, const GLfloat *value, DefaultUniformBlockMap *defaultUniformBlocks, \
+        gl::ShaderBitSet *defaultUniformBlocksDirty)
+ANGLE_SET_UNIFORM_MATRIX_FV_SPECIALIZATION(2, 2);
+ANGLE_SET_UNIFORM_MATRIX_FV_SPECIALIZATION(2, 3);
+ANGLE_SET_UNIFORM_MATRIX_FV_SPECIALIZATION(2, 4);
+ANGLE_SET_UNIFORM_MATRIX_FV_SPECIALIZATION(3, 2);
+ANGLE_SET_UNIFORM_MATRIX_FV_SPECIALIZATION(3, 3);
+ANGLE_SET_UNIFORM_MATRIX_FV_SPECIALIZATION(3, 4);
+ANGLE_SET_UNIFORM_MATRIX_FV_SPECIALIZATION(4, 2);
+ANGLE_SET_UNIFORM_MATRIX_FV_SPECIALIZATION(4, 3);
+ANGLE_SET_UNIFORM_MATRIX_FV_SPECIALIZATION(4, 4);
+
+template <typename T>
+void GetUniform(const gl::ProgramExecutable *executable,
+                GLint location,
+                T *v,
+                GLenum entryPointType,
+                const DefaultUniformBlockMap *defaultUniformBlocks)
+{
+    const gl::VariableLocation &locationInfo = executable->getUniformLocations()[location];
+    const gl::LinkedUniform &linkedUniform   = executable->getUniforms()[locationInfo.index];
+
+    ASSERT(!linkedUniform.isSampler() && !linkedUniform.isImage());
+
+    const gl::ShaderType shaderType = linkedUniform.getFirstActiveShaderType();
+    ASSERT(shaderType != gl::ShaderType::InvalidEnum);
+
+    const BufferAndLayout &uniformBlock   = *(*defaultUniformBlocks)[shaderType];
+    const sh::BlockMemberInfo &layoutInfo = uniformBlock.uniformLayout[location];
+
+    ASSERT(linkedUniform.getUniformTypeInfo().componentType == entryPointType ||
+           linkedUniform.getUniformTypeInfo().componentType ==
+               gl::VariableBoolVectorType(entryPointType));
+
+    if (gl::IsMatrixType(linkedUniform.getType()))
+    {
+        const uint8_t *ptrToElement = uniformBlock.uniformData.data() + layoutInfo.offset +
+                                      (locationInfo.arrayIndex * layoutInfo.arrayStride);
+        GetMatrixUniform(linkedUniform.getType(), v, reinterpret_cast<const T *>(ptrToElement),
+                         false);
+    }
+    else
+    {
+        ReadFromBufferWithLayout(linkedUniform.getElementComponents(), locationInfo.arrayIndex, v,
+                                 layoutInfo, &uniformBlock.uniformData);
+    }
+}
+
+template void GetUniform<GLint>(const gl::ProgramExecutable *executable,
+                                GLint location,
+                                GLint *v,
+                                GLenum entryPointType,
+                                const DefaultUniformBlockMap *defaultUniformBlocks);
+template void GetUniform<GLuint>(const gl::ProgramExecutable *executable,
+                                 GLint location,
+                                 GLuint *v,
+                                 GLenum entryPointType,
+                                 const DefaultUniformBlockMap *defaultUniformBlocks);
+template void GetUniform<GLfloat>(const gl::ProgramExecutable *executable,
+                                  GLint location,
+                                  GLfloat *v,
+                                  GLenum entryPointType,
+                                  const DefaultUniformBlockMap *defaultUniformBlocks);
 
 const angle::Format &GetFormatFromFormatType(GLenum format, GLenum type)
 {
@@ -1734,6 +2017,7 @@ const gl::ColorGeneric AdjustBorderColor(const angle::ColorGeneric &borderColorG
 
     return adjustedBorderColor;
 }
+
 template const gl::ColorGeneric AdjustBorderColor<true>(
     const angle::ColorGeneric &borderColorGeneric,
     const angle::Format &format,
@@ -1743,4 +2027,114 @@ template const gl::ColorGeneric AdjustBorderColor<false>(
     const angle::Format &format,
     bool stencilMode);
 
+bool TextureHasAnyRedefinedLevels(const gl::CubeFaceArray<gl::TexLevelMask> &redefinedLevels)
+{
+    for (gl::TexLevelMask faceRedefinedLevels : redefinedLevels)
+    {
+        if (faceRedefinedLevels.any())
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool IsTextureLevelRedefined(const gl::CubeFaceArray<gl::TexLevelMask> &redefinedLevels,
+                             gl::TextureType textureType,
+                             gl::LevelIndex level)
+{
+    gl::TexLevelMask redefined = redefinedLevels[0];
+
+    if (textureType == gl::TextureType::CubeMap)
+    {
+        for (size_t face = 1; face < gl::kCubeFaceCount; ++face)
+        {
+            redefined |= redefinedLevels[face];
+        }
+    }
+
+    return redefined.test(level.get());
+}
+
+bool TextureRedefineLevel(const TextureLevelAllocation levelAllocation,
+                          const TextureLevelDefinition levelDefinition,
+                          bool immutableFormat,
+                          uint32_t levelCount,
+                          const uint32_t layerIndex,
+                          const gl::ImageIndex &index,
+                          gl::LevelIndex imageFirstAllocatedLevel,
+                          gl::CubeFaceArray<gl::TexLevelMask> *redefinedLevels)
+{
+    // If the level that's being redefined is outside the level range of the allocated
+    // image, the application is free to use any size or format.  Any data uploaded to it
+    // will live in staging area until the texture base/max level is adjusted to include
+    // this level, at which point the image will be recreated.
+    //
+    // Otherwise, if the level that's being redefined has a different format or size,
+    // only release the image if it's single-mip, and keep the uploaded data staged.
+    // Otherwise the image is mip-incomplete anyway and will be eventually recreated when
+    // needed.  Only exception to this latter is if all the levels of the texture are
+    // redefined such that the image becomes mip-complete in the end.
+    // redefinedLevels is used during syncState to support this use-case.
+    //
+    // Note that if the image has multiple mips, there could be a copy from one mip
+    // happening to the other, which means the image cannot be released.
+    //
+    // In summary:
+    //
+    // - If the image has a single level, and that level is being redefined, release the
+    //   image.
+    // - Otherwise keep the image intact (another mip may be the source of a copy), and
+    //   make sure any updates to this level are staged.
+    gl::LevelIndex levelIndexGL(index.getLevelIndex());
+    const bool isCompatibleRedefinition =
+        levelAllocation == TextureLevelAllocation::WithinAllocatedImage &&
+        levelDefinition == TextureLevelDefinition::Compatible;
+    const bool isCubeMap = index.getType() == gl::TextureType::CubeMap;
+
+    // Mark the level as incompatibly redefined if that's the case.  Note that if the level
+    // was previously incompatibly defined, then later redefined to be compatible, the
+    // corresponding bit should clear.
+    if (levelAllocation == TextureLevelAllocation::WithinAllocatedImage)
+    {
+        // Immutable texture should never have levels redefined.
+        ASSERT(isCompatibleRedefinition || !immutableFormat);
+
+        const uint32_t redefinedFace = isCubeMap ? layerIndex : 0;
+        (*redefinedLevels)[redefinedFace].set(levelIndexGL.get(), !isCompatibleRedefinition);
+    }
+
+    const bool isUpdateToSingleLevelImage =
+        levelCount == 1 && imageFirstAllocatedLevel == levelIndexGL;
+
+    // If incompatible, and redefining the single-level image, the caller will release the texture
+    // so it can be recreated immediately.  This is needed so that the texture can be reallocated
+    // with the correct format/size.
+    //
+    // This is not done for cubemaps because every face may be separately redefined.  Note
+    // that this is not possible for texture arrays in general.
+    bool shouldReleaseImage = !isCompatibleRedefinition && isUpdateToSingleLevelImage && !isCubeMap;
+    return shouldReleaseImage;
+}
+
+void TextureRedefineGenerateMipmapLevels(gl::LevelIndex baseLevel,
+                                         gl::LevelIndex maxLevel,
+                                         gl::LevelIndex firstGeneratedLevel,
+                                         gl::CubeFaceArray<gl::TexLevelMask> *redefinedLevels)
+{
+    static_assert(gl::IMPLEMENTATION_MAX_TEXTURE_LEVELS < 32,
+                  "levels mask assumes 32-bits is enough");
+    // Generate bitmask for (baseLevel, maxLevel]. `+1` because bitMask takes `the number of bits`
+    // but levels start counting from 0
+    gl::TexLevelMask levelsMask(angle::BitMask<uint32_t>(maxLevel.get() + 1));
+    levelsMask &= static_cast<uint32_t>(~angle::BitMask<uint32_t>(firstGeneratedLevel.get()));
+    // Remove (baseLevel, maxLevel] from redefinedLevels. These levels are no longer incompatibly
+    // defined if they previously were.  The corresponding bits in redefinedLevels should be
+    // cleared.
+    for (size_t face = 0; face < gl::kCubeFaceCount; ++face)
+    {
+        (*redefinedLevels)[face] &= ~levelsMask;
+    }
+}
 }  // namespace rx
